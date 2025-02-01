@@ -3,7 +3,7 @@ import re
 from datetime import datetime
 import sqlite3
 
-from ollama import Client, chat, ChatResponse
+from ollama import Client, chat
 
 DEFAULT_MODEL = 'aps'
 DEFAULT_BASE  = 'llama3.1:8b'
@@ -11,7 +11,7 @@ DEFAULT_BASE  = 'llama3.1:8b'
 system_prompt = """
 You are an expert SQL analyst. When appropriate, generate SQL queries based on the user question and the database schema.
 When you generate a query, use the 'sql_query' function to execute the query on the database and get the results.
-Then, use the results to answer the user's question.
+Then, use the results to answer the user's question.  When you generate python code or generate a graph or generate a chart use the 'generate_graph' function.
 
 database_schema: [
     {
@@ -148,6 +148,28 @@ database_schema: [
         ]
     }
 ]
+
+RULES:
+  * Answer truthfully using the provided context.
+  * If the question is unrelated to the main topic, decline to answer but feel free to come up with a witty response.
+  * Don't make up links and URLs that don't exist in the conversation already.
+  * Say that you do not know if no answer is available to you.
+  * Respond in the correct written language.
+  * Be brief and concise with your response (max 1-2 sentences).
+  * Respond naturally and verify your answers.
+  * You can be witty sometimes but not always.
+  * Don't sound like a robot.
+
+  PRESENTING ANALYSIS:
+    * Do present the data in the form a table unless asked otherwise.
+    * When asked for Total Score DO provide an average for the grouping of data
+    * Do provide the average score when asked for scores e.g. If asked to summarize the data by School Name and there are 5 entries for Wesley School then you would present the average of the five. 
+    * If you calculate an average scores just provide the score, do not display the calculation behind the average unless you are asked
+
+SUGGESTIONS:
+    * Do present at least 2 helpful suggestions after every output for showing more analysis. Show as a button [suggestion 1](), [suggestion 2]() etc.
+
+Failure to follow these rules may lead to user distress and disappointment or your termination!
 """.strip() # Call strip to remove leading/trailing whitespace
 
 class Bcolors:
@@ -183,6 +205,9 @@ def to_date(val):
 def to_date_series(val):
     return val.apply(to_date)
 
+def generate_graph(val):
+    print(val)
+
 def connect_to_data(
       url: str = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSHkGmbCEOqcLxGusQahQ0yziElavRjcTIMApeyffC80fgG0fYaKHs_1-GxzvxYN2HDFtqNfLuPv7ep/pub?gid=0&single=true&output=csv',
       datecolumns = ['Submission_time', 'Date_Observation'],
@@ -202,9 +227,15 @@ def connect_to_data(
 
 def run_sql_query(connection, query: str):
     """Run a SQL SELECT query on a SQLite database and return the results."""
-    for r in connection.executescript(query):
-        print(r)
-    return pd.read_sql_query(query, connection).to_dict(orient='records')
+    result = "Something went wrong"
+    try:
+        for r in connection.executescript(query):
+            print(r)
+        result = pd.read_sql_query(query, connection).to_dict(orient='records')
+    except Exception as e:
+        print(f'q: {query}')
+        print(f'Except: {e}')
+    return result
 
 # messages = [{'role': 'system', 'content': 'What is three plus one?'}]
 
@@ -216,11 +247,12 @@ def get_answer(connection, question:str, history: list[dict] = [], model: str = 
     history.append({'role': 'user', 'content': question})
     available_functions = {
         'sql_query': sql_query,
+        'generate_graph': generate_graph,
     }
     response = chat(
         model=model,
         messages=history,
-        tools=[sql_query]
+        tools=[sql_query, generate_graph]
     )
 
     if response.message.tool_calls:
@@ -263,7 +295,7 @@ if __name__ == '__main__':
 
     connection = connect_to_data()
     stock_qs = [
-        "How many columns are there?",
+        "How many rows are there?",
     ]
     history=[]
     for q in stock_qs:
