@@ -2,6 +2,7 @@ import pandas as pd
 import re
 from datetime import datetime
 import sqlite3
+import argparse
 
 from ollama import Client, chat
 
@@ -285,6 +286,19 @@ def create_model_with_system(model:str = DEFAULT_MODEL, from_model:str = DEFAULT
     )
     return result
 
+def get_arguments():
+    parser = argparse.ArgumentParser(
+        description="Manages the RAG llama model"
+    )
+    parser.add_argument(
+        "-b", "--build",
+        help="Build the APS model",
+        dest="build",
+        default=False,
+        action='store_true'
+    )
+    return parser.parse_args()
+
 if __name__ == '__main__':
     ef = f'{Bcolors.ENDC}'
     bf = Bcolors.BOLD
@@ -293,6 +307,12 @@ if __name__ == '__main__':
     qtf = Bcolors.WHITE
     atf = ''
 
+    args = get_arguments()
+    if args.build:
+        result = create_model_with_system()
+        print(result)
+        quit()
+        
     connection = connect_to_data()
     stock_qs = [
         "How many rows are there?",
