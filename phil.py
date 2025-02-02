@@ -12,11 +12,16 @@ DEFAULT_BASE  = 'llama3.1:8b'
 system_prompt = """
 You are an expert SQL analyst. When appropriate, generate SQL queries based on the user question and the database schema.
 When you generate a query, use the 'sql_query' function to execute the query on the database and get the results.
-Then, use the results to answer the user's question.  When you generate python code or generate a graph or generate a chart use the 'generate_graph' function.
+Then, use the results to answer the user's question.
+
+Use javascript and the D3.js library to generate charts and graphs.  For safety, you must pass this code to the
+'generate_graph' function.
+
+There is only one table so don't bother mentioning its name. Instead of talking about a database, use the word system.
 
 database_schema: [
     {
-        table: 'evals',
+        table: 'eval',
         columns: [
             {
                 name: 'Date_Observation',
@@ -207,6 +212,7 @@ def to_date_series(val):
     return val.apply(to_date)
 
 def generate_graph(val):
+    print("***** I was called *****")
     print(val)
 
 def connect_to_data(
@@ -261,17 +267,17 @@ def get_answer(connection, question:str, history: list[dict] = [], model: str = 
         for tool in response.message.tool_calls:
             # Ensure the function is available, and then call it
             if function_to_call := available_functions.get(tool.function.name):
-                #print('Calling function:', tool.function.name)
-                #print('Arguments:', tool.function.arguments)
+                print('Calling function:', tool.function.name)
+                print('Arguments:', tool.function.arguments)
                 output = function_to_call(**tool.function.arguments)
-                #print('Function output:', output)
+                print('Function output:', output)
             else:
                 print('Function', tool.function.name, 'not found')
 
         history.append(response.message)
         history.append({'role': 'tool', 'content': str(output), 'name': tool.function.name})
         response = chat(final_model, messages=history)
-
+        print(f'*** tools? {response.message.tool_calls}')
     history.append({'role': 'assistant', 'content': response.message.content})
 
     return (response.message.content, history, response)

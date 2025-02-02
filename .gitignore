@@ -1,1 +1,13 @@
+# OSX
+#
+.DS_Store
+
+# Xcode
+#
+*.code-workspace
+
+# python
+__pycache__
+
+# app
 *.db
