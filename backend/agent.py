@@ -3,8 +3,9 @@ import re
 from datetime import datetime
 import sqlite3
 import argparse
+import logging
 
-from ollama import Client, chat
+from ollama import Client, chat, ChatResponse
 
 DEFAULT_MODEL = 'aps'
 DEFAULT_BASE  = 'llama3.1:8b'
@@ -12,10 +13,9 @@ DEFAULT_BASE  = 'llama3.1:8b'
 system_prompt = """
 You are an expert SQL analyst. When appropriate, generate SQL queries based on the user question and the database schema.
 When you generate a query, use the 'sql_query' function to execute the query on the database and get the results.
-Then, use the results to answer the user's question.
+Then, use the results to answer the user's question. You should only use SQL supported by sqlite3
 
-Use javascript and the D3.js library to generate charts and graphs.  For safety, you must pass this code to the
-'generate_graph' function.
+Use javascript and the D3.js library to generate charts and graphs.
 
 There is only one table so don't bother mentioning its name. Instead of talking about a database, use the word system.
 
@@ -212,15 +212,18 @@ def to_date_series(val):
     return val.apply(to_date)
 
 def generate_graph(val):
-    print("***** I was called *****")
-    print(val)
+    # TODO: Implement support for graph generation - somehow
+    pass
 
-def connect_to_data(
+def get_connection(project = 'phil') -> sqlite3.Connection:
+    return sqlite3.connect(project + '.db')
+
+def initialize_database(
       url: str = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSHkGmbCEOqcLxGusQahQ0yziElavRjcTIMApeyffC80fgG0fYaKHs_1-GxzvxYN2HDFtqNfLuPv7ep/pub?gid=0&single=true&output=csv',
       datecolumns = ['Submission_time', 'Date_Observation'],
       project = 'phil',
       table = 'eval'
-):
+) -> sqlite3.Connection:
     dataframe = pd.read_csv(url, index_col=0)
     to_replace = {}
     for col in dataframe.columns:
@@ -236,17 +239,19 @@ def run_sql_query(connection, query: str):
     """Run a SQL SELECT query on a SQLite database and return the results."""
     result = "Something went wrong"
     try:
-        for r in connection.executescript(query):
-            print(r)
         result = pd.read_sql_query(query, connection).to_dict(orient='records')
     except Exception as e:
-        print(f'q: {query}')
-        print(f'Except: {e}')
+        logging.warning(f"Bad query: '{query}'")
+        logging.warning(f'Error: {e}')
     return result
 
 # messages = [{'role': 'system', 'content': 'What is three plus one?'}]
 
-def get_answer(connection, question:str, history: list[dict] = [], model: str = DEFAULT_MODEL, final_model: str = None):
+def get_answer(
+    connection:sqlite3.Connection, 
+    question:str, history: list[dict] = [], 
+    model: str = DEFAULT_MODEL, final_model: str = None) -> tuple[str, list[dict], ChatResponse]:
+
     if final_model is None: final_model = model
     def sql_query(query: str):
         return run_sql_query(connection, query)
@@ -259,7 +264,8 @@ def get_answer(connection, question:str, history: list[dict] = [], model: str = 
     response = chat(
         model=model,
         messages=history,
-        tools=[sql_query, generate_graph]
+        tools=[sql_query, generate_graph],
+        format="json"
     )
 
     if response.message.tool_calls:
@@ -267,19 +273,22 @@ def get_answer(connection, question:str, history: list[dict] = [], model: str = 
         for tool in response.message.tool_calls:
             # Ensure the function is available, and then call it
             if function_to_call := available_functions.get(tool.function.name):
-                print('Calling function:', tool.function.name)
-                print('Arguments:', tool.function.arguments)
+                logging.debug(f"Calling function: '{tool.function.name}'")
+                logging.debug(f"Arguments:{tool.function.arguments}'")
                 output = function_to_call(**tool.function.arguments)
-                print('Function output:', output)
+                logging.debug(f"****Function output:\n{output}\n****")
             else:
-                print('Function', tool.function.name, 'not found')
+                logging.warning(f"Function '{tool.function.name}' not found")
 
         history.append(response.message)
         history.append({'role': 'tool', 'content': str(output), 'name': tool.function.name})
         response = chat(final_model, messages=history)
-        print(f'*** tools? {response.message.tool_calls}')
+
     history.append({'role': 'assistant', 'content': response.message.content})
 
+    # Now that we've got our answer, we're going to pull the "Message" out of the 
+    # history because it's not serializable (and hopefully not necessary?)
+    history  = [ itm for itm in history if type(itm) == dict ]
     return (response.message.content, history, response)
 
 def create_model_with_system(model:str = DEFAULT_MODEL, from_model:str = DEFAULT_BASE):
@@ -319,7 +328,7 @@ if __name__ == '__main__':
         print(result)
         quit()
         
-    connection = connect_to_data()
+    connection = initialize_database()
     stock_qs = [
         "How many rows are there?",
     ]
