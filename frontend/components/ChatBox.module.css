@@ -15,15 +15,16 @@
   
 .form {
   display: grid;
-  grid-template-columns: 1fr 40px;
-  border-top: 1px solid #eee;
+  grid-template-columns: 1fr 33px;
+  /* border-top: 1px solid #eee; */
 }
   
 .textarea {
   border: 1px solid transparent;
   resize: none;
   padding: 1em;
-  border: 0;
+  margin-left: 16px;
+  border: 1px solid #f1f1f1;
   font-family:
     -apple-system,
     BlinkMacSystemFont,
@@ -39,7 +40,7 @@
   font-size: 1.2em;
 }
 .textarea:focus {
-  border: 1px solid lightgray
+  border: 1px solid lightgray;
 }
 .button {
   border: 0;

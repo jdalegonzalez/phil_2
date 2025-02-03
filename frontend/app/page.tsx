@@ -1,5 +1,9 @@
-import Head from 'next/head';
 import dynamic from 'next/dynamic';
+import { Metadata } from 'next';
+
+export const metadata: Metadata = {
+  title: 'DEMO Teacher Report Chat',
+};
 
 const Chat = dynamic(() => import('../components/Chat'), {
   ssr: !!false,
@@ -8,11 +12,6 @@ const Chat = dynamic(() => import('../components/Chat'), {
 export default function Home() {
   return (
     <div className="container">
-      <Head>
-        <title>DEMO Teacher Report Chat</title>
-        <link rel="icon" href="https://thoughtbox.ai/wp-content/uploads/2025/01/cropped-thoughtbox-ico-32x32.png" sizes="32x32" />
-        <link rel="icon" href="https://thoughtbox.ai/wp-content/uploads/2025/01/cropped-thoughtbox-ico-192x192.png" sizes="192x192"/>
-      </Head>
       <main>
         <div className="head_container">
           <div className="row">
