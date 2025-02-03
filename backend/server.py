@@ -4,12 +4,15 @@ import os
 import uuid
 import logging
 
-from fastapi import FastAPI, Depends
-from agent import get_connection, get_answer, initialize_database
 from sqlite3 import Connection
 
+from fastapi import FastAPI, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
+
+from agent import get_connection, get_answer, initialize_database
+
 
 ######## Constants
 SESSION_AGE = 60 * 60 # 60 seconds * 60 = 1 hour
@@ -22,6 +25,25 @@ key = os.getenv('TBOXAI_SESSION_KEY',str(uuid.uuid4()))
 # We'll want to change this to redis once we have more than 
 # one server.
 app.add_middleware(SessionMiddleware, secret_key=key, max_age=SESSION_AGE)
+
+origins = [
+    "http://localhost",
+    "http://localhost:3000",
+    "https://localhost",
+    "https://localhost:3000",
+    "http://127.0.0.1",
+    "http://127.0.0.1:3000",
+    "https://127.0.0.1",
+    "https://127.0.0.1:3000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 async def get_session(request: Request):
     return request.session
