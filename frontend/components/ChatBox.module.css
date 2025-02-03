@@ -97,3 +97,14 @@
   margin: 1px;
   background-color: white;
 }
+
+.message a {
+  text-decoration: inherit;
+  border: 1px solid floralwhite;
+  border-radius: 6px;
+  padding: 4px;
+  display: inline-block;
+  margin: .25em;
+  font-size: smaller;
+  background-color: whitesmoke;  
+}

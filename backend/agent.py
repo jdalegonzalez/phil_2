@@ -11,13 +11,28 @@ DEFAULT_MODEL = 'aps'
 DEFAULT_BASE  = 'llama3.1:8b'
 
 system_prompt = """
-You are an expert SQL analyst. When appropriate, generate SQL queries based on the user question and the database schema.
+You are an expert SQL analyst and python data-scientist. When appropriate, generate SQL queries based on the user question and the database schema.
 When you generate a query, use the 'sql_query' function to execute the query on the database and get the results.
 Then, use the results to answer the user's question. You should only use SQL supported by sqlite3
 
-Use javascript and the D3.js library to generate charts and graphs.
+* There is only one table so don't bother mentioning its name. Instead of talking about a database, use the word system.
+* When you're generating table headings, replace underscores ('_') with spaces.
 
-There is only one table so don't bother mentioning its name. Instead of talking about a database, use the word system.
+* ALWAYS FORMAT YOUR RESPONSE IN MARKDOWN
+
+* ALWAYS RESPOND ONLY WITH CODE IN CODE BLOCK LIKE THIS:
+
+```python
+{code}
+```
+
+* the Python code runs in a jupyter notebook.
+* every time you generate Python, the code is executed in a separate cell. it's okay to make multiple calls to `execute_python`.
+* display visualizations using matplotlib or any other visualization library directly in the notebook. don't worry about saving the visualizations to a file.
+* you have access to the internet and can make api requests.
+* you also have access to the filesystem and can read/write files.
+* you can install any pip package (if it exists) if you need to be running `!pip install {package}`. The usual packages for data analysis are already preinstalled though.
+* you can run any Python code you want, everything is running in a secure sandbox environment
 
 database_schema: [
     {
@@ -167,13 +182,14 @@ RULES:
   * Don't sound like a robot.
 
 PRESENTING ANALYSIS:
-  * Do present the data in the form a table unless asked otherwise.
+  * Do present the data in the form of a table unless asked otherwise.
   * When asked for Total Score DO provide an average for the grouping of data
   * Do provide the average score when asked for scores e.g. If asked to summarize the data by School Name and there are 5 entries for Wesley School then you would present the average of the five. 
   * If you calculate an average scores just provide the score, do not display the calculation behind the average unless you are asked
 
 SUGGESTIONS:
-  * Do present at least 2 helpful suggestions after every output for showing more analysis. Before the list of suggestions, include the text 'Here are some suggestions:' in bold.  Each suggestion should be a markdown hyperlink like [This is a suggestion.](#).
+  * Do present at least 2 helpful suggestions after every output for showing more analysis. 
+    Provide the suggests as hyperlinks in the format: [This is a suggestion.](#). Before the suggestions, include the text: '**Here are some suggestions:**'.  
 
 Failure to follow these rules may lead to user distress and disappointment or your termination!
 """.strip() # Call strip to remove leading/trailing whitespace
@@ -211,9 +227,21 @@ def to_date(val):
 def to_date_series(val):
     return val.apply(to_date)
 
-def generate_graph(val):
-    # TODO: Implement support for graph generation - somehow
-    pass
+def generate_graph(code: str) -> str:
+    """
+    Executes a block of python code that is expected to use matplotlib to generate a graph
+    and then returns an svg tag that can be displayed to the user.
+
+    Args:
+        code: The block of python code that can generate an image
+
+    Returns:
+        str: A markdown, embeddable SVG
+    """
+    print("***** I WAS CALLED ********")
+    print(code)
+
+    return "![svg image](data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%22100%22%20height%3D%22100%22%20viewBox%3D%220%200%20100%20100%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2240%22%20stroke%3D%22black%22%20stroke-width%3D%223%22%20fill%3D%22red%22%20/%3E%3C/svg%3E%0A)"
 
 def get_connection(project = 'phil') -> sqlite3.Connection:
     return sqlite3.connect(project + '.db')
@@ -235,9 +263,18 @@ def initialize_database(
     dataframe.to_sql(table, connection, if_exists='replace')
     return connection
 
-def run_sql_query(connection, query: str):
-    """Run a SQL SELECT query on a SQLite database and return the results."""
-    result = "Something went wrong"
+def run_sql_query(connection: sqlite3.Connection, query: str) -> dict:
+    """
+    Runs an SQL query and returns the result as a dict
+
+    Args:
+        connection: The database connection to use for the query
+        query: The query to be run
+
+    Returns:
+        dict: The results object
+    """
+    result = None
     try:
         result = pd.read_sql_query(query, connection).to_dict(orient='records')
     except Exception as e:
@@ -253,7 +290,17 @@ def get_answer(
     model: str = DEFAULT_MODEL, final_model: str = None) -> tuple[str, list[dict], ChatResponse]:
 
     if final_model is None: final_model = model
+
     def sql_query(query: str):
+        """
+        Runs an SQL query and returns the result as a dict
+
+        Args:
+            query: The query to be run
+
+        Returns:
+            dict: The results object
+        """
         return run_sql_query(connection, query)
    
     history.append({'role': 'user', 'content': question})
@@ -264,7 +311,7 @@ def get_answer(
     response = chat(
         model=model,
         messages=history,
-        tools=[sql_query, generate_graph],
+        tools=list(available_functions.values()),
         format="json"
     )
 

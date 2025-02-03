@@ -77,9 +77,19 @@ export default function ChatBox() {
     messageEnd.scrollIntoView({ behaviour: 'smooth' });
   });
 
+  const handleClick = ((e) => {
+    if (e.target instanceof HTMLAnchorElement) {
+      e.preventDefault();
+      e.stopPropagation();
+      setMessageText(e.target.text);
+      inputBox.focus();
+      return true;
+    }
+  });
+
   return (
     <div className={styles.chatHolder}>
-      <div className={styles.chatText}>
+      <div className={styles.chatText} onClick={handleClick}>
         {messages}
         <div ref={(element) => { messageEnd = element; }} ></div>
       </div>
