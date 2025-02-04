@@ -108,3 +108,12 @@
   font-size: smaller;
   background-color: whitesmoke;  
 }
+
+.message pre {
+  margin: 8px 0 8px 0;
+  border: 1px solid rgba(24, 24, 24, .50);
+  border-radius: 6px;
+  background: whitesmoke;
+  color: #242424;
+  padding: 10px;  
+}

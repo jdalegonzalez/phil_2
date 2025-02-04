@@ -1,4 +1,8 @@
-import pandas as pd
+import pandas
+import matplotlib
+import base64
+
+import io
 import re
 from datetime import datetime
 import sqlite3
@@ -12,27 +16,15 @@ DEFAULT_BASE  = 'llama3.1:8b'
 
 system_prompt = """
 You are an expert SQL analyst and python data-scientist. When appropriate, generate SQL queries based on the user question and the database schema.
-When you generate a query, use the 'sql_query' function to execute the query on the database and get the results.
-Then, use the results to answer the user's question. You should only use SQL supported by sqlite3
+When you generate a query, use the 'sql_query' function to execute the query on the database and get the results. Then, use the results to answer the user's question. 
+You should only use SQL supported by sqlite3.  DO NOT try to fetch graphs or tables from the internet.
 
 * There is only one table so don't bother mentioning its name. Instead of talking about a database, use the word system.
-* When you're generating table headings, replace underscores ('_') with spaces.
+* When you're generating table headings, replace underscores ('_') with spaces. 
 
 * ALWAYS FORMAT YOUR RESPONSE IN MARKDOWN
 
-* ALWAYS RESPOND ONLY WITH CODE IN CODE BLOCK LIKE THIS:
-
-```python
-{code}
-```
-
-* the Python code runs in a jupyter notebook.
-* every time you generate Python, the code is executed in a separate cell. it's okay to make multiple calls to `execute_python`.
-* display visualizations using matplotlib or any other visualization library directly in the notebook. don't worry about saving the visualizations to a file.
-* you have access to the internet and can make api requests.
-* you also have access to the filesystem and can read/write files.
-* you can install any pip package (if it exists) if you need to be running `!pip install {package}`. The usual packages for data analysis are already preinstalled though.
-* you can run any Python code you want, everything is running in a secure sandbox environment
+* To create a graph, chart or plot use ONLY python, sql_query, pandas, and matplotlib. Do NOT use sqlalchemy.  You do not need to call plt.show()
 
 database_schema: [
     {
@@ -44,7 +36,7 @@ database_schema: [
             },
             {
                 name: 'School_Name',
-                type: 'string',
+                type: 'string',  
             },
             {
                 name: 'APS_Cluster',
@@ -227,7 +219,7 @@ def to_date(val):
 def to_date_series(val):
     return val.apply(to_date)
 
-def generate_graph(code: str) -> str:
+def run_generate_graph(connection: sqlite3.Connection, code: str) -> str:
     """
     Executes a block of python code that is expected to use matplotlib to generate a graph
     and then returns an svg tag that can be displayed to the user.
@@ -238,9 +230,23 @@ def generate_graph(code: str) -> str:
     Returns:
         str: A markdown, embeddable SVG
     """
-    print("***** I WAS CALLED ********")
-    print(code)
+    
+    def sql_query(query:str) -> dict:
+        return run_sql_query(connection, query)
+    
 
+    loc = dict(locals())
+    exec(code, globals(), loc)
+    if (plt := loc.get('plt')):
+        # Save the plot to a BytesIO object in SVG format
+        svg_buffer = io.BytesIO()
+        plt.savefig(svg_buffer, format='svg')
+        # Get the string representation of the SVG
+        svg_string = svg_buffer.getvalue().decode()        
+        res = f'![svg image](data:image/svg+xml;base64,{base64.b64encode(svg_string.encode('utf-8'))})'
+        print(res)
+        return res
+    
     return "![svg image](data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%22100%22%20height%3D%22100%22%20viewBox%3D%220%200%20100%20100%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2240%22%20stroke%3D%22black%22%20stroke-width%3D%223%22%20fill%3D%22red%22%20/%3E%3C/svg%3E%0A)"
 
 def get_connection(project = 'phil') -> sqlite3.Connection:
@@ -252,7 +258,7 @@ def initialize_database(
       project = 'phil',
       table = 'eval'
 ) -> sqlite3.Connection:
-    dataframe = pd.read_csv(url, index_col=0)
+    dataframe = pandas.read_csv(url, index_col=0)
     to_replace = {}
     for col in dataframe.columns:
         new_col = col.strip().replace(' ', '_').replace(':','').replace('/','_')
@@ -276,13 +282,43 @@ def run_sql_query(connection: sqlite3.Connection, query: str) -> dict:
     """
     result = None
     try:
-        result = pd.read_sql_query(query, connection).to_dict(orient='records')
+        result = pandas.read_sql_query(query, connection).to_dict(orient='records')
     except Exception as e:
         logging.warning(f"Bad query: '{query}'")
         logging.warning(f'Error: {e}')
     return result
 
 # messages = [{'role': 'system', 'content': 'What is three plus one?'}]
+
+def convert_python_if_necessary(connection: sqlite3.Connection, message: str):
+    """
+    Looks for strings that intend to produce charts and redirects
+    to charting code here.  I REALLY wanted to be fancy and get the
+    agent to call my code automatically but it is refusing to do it.
+    SO...
+
+    Args:
+        connection: The active database connection
+        message: The message returned from the LLM
+    
+    Returns:
+        str: Either the message unchanged or the code run and
+             converted into svg
+    """
+    m = message.strip()
+    print("Starts ok", m.startswith('```python'))
+    print("Ends OK", m.endswith('```'))
+    print(m[-4:])
+    print("Imports", "import matplotlib.pyplot" in m)
+    if not m.startswith('```python') or not m.endswith('```'):
+        return message
+    
+    #OK, it's at least python.
+    if "import matplotlib.pyplot" not in m: return message
+
+    #OK, it's attempting to do something with plotting.
+    # Try to find the result
+    return run_generate_graph(connection, m)
 
 def get_answer(
     connection:sqlite3.Connection, 
@@ -302,6 +338,20 @@ def get_answer(
             dict: The results object
         """
         return run_sql_query(connection, query)
+   
+    def generate_graph(code: str):
+        """
+        Executes a block of python code to generate charts and graphs.  The 
+        code is expected to use matplotlib and pandas, along with the sql_query
+        function.
+
+        Args:
+            code: The python code to generate the graph or chart
+
+        Returns:
+            str: an embeddale svg.
+        """
+        return run_generate_graph(connection, code)
    
     history.append({'role': 'user', 'content': question})
     available_functions = {
@@ -323,7 +373,6 @@ def get_answer(
                 logging.debug(f"Calling function: '{tool.function.name}'")
                 logging.debug(f"Arguments:{tool.function.arguments}'")
                 output = function_to_call(**tool.function.arguments)
-                logging.debug(f"****Function output:\n{output}\n****")
             else:
                 logging.warning(f"Function '{tool.function.name}' not found")
 
@@ -331,11 +380,14 @@ def get_answer(
         history.append({'role': 'tool', 'content': str(output), 'name': tool.function.name})
         response = chat(final_model, messages=history)
 
+    converted = convert_python_if_necessary(history, response.message.content)
+    print(converted)
     history.append({'role': 'assistant', 'content': response.message.content})
 
     # Now that we've got our answer, we're going to pull the "Message" out of the 
     # history because it's not serializable (and hopefully not necessary?)
     history  = [ itm for itm in history if type(itm) == dict ]
+
     return (response.message.content, history, response)
 
 def create_model_with_system(model:str = DEFAULT_MODEL, from_model:str = DEFAULT_BASE):

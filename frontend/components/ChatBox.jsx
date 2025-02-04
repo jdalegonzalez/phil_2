@@ -94,7 +94,7 @@ export default function ChatBox() {
         <div ref={(element) => { messageEnd = element; }} ></div>
       </div>
       <form disabled={isLoading} onSubmit={handleFormSubmission} className={"relative " + styles.form}>
-        <div style={{display: isLoading ? 'block' : 'none', height:'10px', width: '100px', position: 'absolute', left:'-20px', top: '-20px'}}><BouncingDotsLoader /></div>
+        <div style={{display: isLoading ? 'block' : 'none', height:'10px', width: '100px', position: 'absolute', left:'-10px', top: '-20px'}}><BouncingDotsLoader /></div>
         <textarea
           className={"outline-none border-none " + styles.textarea}
           disabled={isLoading}
