@@ -3,7 +3,7 @@ import styles from './ChatBox.module.css';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import BouncingDotsLoader from './BouncingDotsLoader';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 
 const api_url = 'http://localhost:8000'
 
@@ -14,6 +14,8 @@ export default function ChatBox() {
   const [messageText, setMessageText] = useState('');
   const [receivedMessages, setMessages] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [partialText, setPartialText] = useState(undefined);
+  const [messageIndex, setMessageIndex] = useState(-1);
   const messageTextIsEmpty = messageText.trim().length === 0;
 
   const addMessage = (who, message) => {
@@ -31,13 +33,14 @@ export default function ChatBox() {
     setIsLoading(true);
     setMessageText('');
     try {
-      const response = await fetch(api_url + '?q=' + messageText)
+      const response = await fetch(api_url + '?q=' + messageText, {method: 'GET', credentials: 'include'})
       if (!response.ok) {
         throw new Error('Failed to reach server');
       }
       const data = await response.json()
       setIsLoading(false);
-      addMessage('server',data.answer)
+      console.log("*******FROM SERVER*****");
+      addMessage('server',data.answer);
       inputBox.focus();
     }
     catch(error) {
@@ -50,24 +53,77 @@ export default function ChatBox() {
     askQuestion(messageText);
   };
 
-  const handleKeyDown = (event) => {
-    if (event.keyCode !== 13 || messageTextIsEmpty) {
+  const cursorAtEnd = (textarea) => {
+    return textarea.selectionStart ==
+           textarea.selectionEnd &&
+           textarea.selectionEnd == textarea.value.length
+  }
+
+  const cursorAtStart = (textarea) => {
+    return textarea.selectionStart ==
+           textarea.selectionEnd &&
+           textarea.selectionEnd == 0
+  }
+
+  const lastSentIndex = (dir) => {
+    const length = receivedMessages.length
+    let ndx = (messageIndex >= 0) ? messageIndex + dir : length - 1;
+    while (ndx >= 0 && ndx < length) {
+      if (receivedMessages[ndx].name == 'me') { return ndx; }
+      ndx += dir
+    }
+    return dir < 0 ? -1 : length
+  }
+
+  const messageFromHistory = (ndx) => {
+    if (ndx == undefined || ndx < 0 || ndx > receivedMessages.length) {
       return;
     }
-    event.preventDefault();
-    askQuestion(messageText);
+
+    if (ndx == receivedMessages.length) {
+      if (partialText != undefined) {
+        setMessageText(partialText);
+      }
+      setPartialText(undefined);
+      setMessageIndex(-1);
+      return
+    }
+    const msg = receivedMessages[ndx];
+    if (partialText == undefined) { setPartialText(inputBox.value) }
+    setMessageIndex(ndx);
+    setMessageText(msg.data)
+  }
+
+  const handleKeyDown = (event) => {
+    if (event.key == 'ArrowUp' && cursorAtStart(event.target)) {
+      event.preventDefault();
+      messageFromHistory(lastSentIndex(-1))
+    }
+    else if (event.key == 'ArrowDown' && cursorAtEnd(event.target)) {
+      event.preventDefault();
+      messageFromHistory(lastSentIndex(1))
+    }
+    else if (event.key == 'Enter' && !messageTextIsEmpty) {
+      event.preventDefault();
+      askQuestion(messageText);
+    }
+    return; // We're not handling it.
   };
+
+  const mytxf = (value) => {
+    if (value.startsWith('data:image/svg+xml')) return value;
+    return defaultUrlTransform(value);
+  }
 
   const messages = receivedMessages.map((message, index) => {
     // const author = message.connectionId === ably.connection.id ? 'me' : 'other';
     const author = message.name;
-    console.log(message.data)
     return (
       <span key={index} className={styles.message} data-author={author}>
         {
           author == 'me' 
           ? message.data 
-          : <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>{message.data}</ReactMarkdown>
+          : <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} urlTransform={mytxf}>{message.data}</ReactMarkdown>
         }
       </span>
     );

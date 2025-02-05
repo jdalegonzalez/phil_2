@@ -1,30 +1,40 @@
-import pandas
-import matplotlib
-import base64
-
-import io
-import re
-from datetime import datetime
-import sqlite3
 import argparse
+import base64
+from datetime import datetime
+import io
 import logging
+import re
+import sqlite3
+from typing import Union
 
-from ollama import Client, chat, ChatResponse
+import matplotlib
+import pandas
+
+from ollama import Client, chat, ChatResponse, Message
 
 DEFAULT_MODEL = 'aps'
 DEFAULT_BASE  = 'llama3.1:8b'
 
+STOCK_QUESTIONS = [
+    'How many rows are there?'
+]
+STOCK_HISTORY = [ {'role': 'user', 'content': question} for question in STOCK_QUESTIONS ]
+
 system_prompt = """
 You are an expert SQL analyst and python data-scientist. When appropriate, generate SQL queries based on the user question and the database schema.
-When you generate a query, use the 'sql_query' function to execute the query on the database and get the results. Then, use the results to answer the user's question. 
-You should only use SQL supported by sqlite3.  DO NOT try to fetch graphs or tables from the internet.
-
-* There is only one table so don't bother mentioning its name. Instead of talking about a database, use the word system.
-* When you're generating table headings, replace underscores ('_') with spaces. 
+When you generate a query, use the 'sql_query' function to execute the query on the database and get the results.  Use the results to answer the user's question.
+ALWAYS use the results from 'sql_query' if available.
+* Do NOT explain how you got those results unless you're asked to.
+* You should only use SQL supported by sqlite3.  DO NOT try to fetch graphs or tables from the internet.
+* There is only one table so don't bother mentioning its name. Instead of talking about a database, use the word "system".
+* In table headings underscores should be replaced with spaces. 
 
 * ALWAYS FORMAT YOUR RESPONSE IN MARKDOWN
 
-* To create a graph, chart or plot use ONLY python, sql_query, pandas, and matplotlib. Do NOT use sqlalchemy.  You do not need to call plt.show()
+* To create a graph, chart or plot use ONLY python, pandas, and pyplot from matplotlib.
+* Use the sql_query function to get the data or include the data you already have.
+* Make sure to use matplotlib and pyplot to generate the graph.
+* NEVER call 'show()'
 
 database_schema: [
     {
@@ -174,14 +184,15 @@ RULES:
   * Don't sound like a robot.
 
 PRESENTING ANALYSIS:
-  * Do present the data in the form of a table unless asked otherwise.
+  * Ppresent the data in the form of a table unless asked otherwise.
   * When asked for Total Score DO provide an average for the grouping of data
   * Do provide the average score when asked for scores e.g. If asked to summarize the data by School Name and there are 5 entries for Wesley School then you would present the average of the five. 
-  * If you calculate an average scores just provide the score, do not display the calculation behind the average unless you are asked
+  * If you calculate an average score just provide the score, do not display the calculation behind the average unless you are asked
 
 SUGGESTIONS:
-  * Do present at least 2 helpful suggestions after every output for showing more analysis. 
-    Provide the suggests as hyperlinks in the format: [This is a suggestion.](#). Before the suggestions, include the text: '**Here are some suggestions:**'.  
+  * Always try to answer the question.
+  * Present at least 2 helpful suggestions after every output for showing more analysis. 
+    Provide the suggests as hyperlinks in the format: [This is a suggestion.](#). Before the suggestions, include a new line and then text: '**Here are some suggestions:**'.  
 
 Failure to follow these rules may lead to user distress and disappointment or your termination!
 """.strip() # Call strip to remove leading/trailing whitespace
@@ -230,24 +241,36 @@ def run_generate_graph(connection: sqlite3.Connection, code: str) -> str:
     Returns:
         str: A markdown, embeddable SVG
     """
-    
-    def sql_query(query:str) -> dict:
-        return run_sql_query(connection, query)
-    
 
-    loc = dict(locals())
-    exec(code, globals(), loc)
-    if (plt := loc.get('plt')):
-        # Save the plot to a BytesIO object in SVG format
-        svg_buffer = io.BytesIO()
-        plt.savefig(svg_buffer, format='svg')
-        # Get the string representation of the SVG
-        svg_string = svg_buffer.getvalue().decode()        
-        res = f'![svg image](data:image/svg+xml;base64,{base64.b64encode(svg_string.encode('utf-8'))})'
-        print(res)
-        return res
     
-    return "![svg image](data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%22100%22%20height%3D%22100%22%20viewBox%3D%220%200%20100%20100%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2240%22%20stroke%3D%22black%22%20stroke-width%3D%223%22%20fill%3D%22red%22%20/%3E%3C/svg%3E%0A)"
+    res = "Something went wrong.  Please try again."
+    try:
+        def sql_query(*a, **kw) -> dict:
+            args = a if a else list(kw.values())
+            query = args[0] if args else ''
+            if not query: raise ValueError("Can't figure out the query")
+            return run_sql_query(connection, query)
+        
+        loc = dict(locals())
+        exec(code, globals(), loc)
+        if (plt := loc.get('plt')):
+            # Save the plot to a BytesIO object in SVG format
+            svg_buffer = io.BytesIO()
+            #plt.tight_layout()
+            plt.gcf().set_size_inches(10, 10)
+            plt.savefig(svg_buffer, format='svg', dpi=100)
+            # Get the string representation of the SVG
+            svg_string = svg_buffer.getvalue().decode()        
+            res = f'![svg image](data:image/svg+xml;base64,{base64.b64encode(svg_string.encode('utf-8')).decode('utf-8')})'
+        else:
+            logging.warning("Didn't get a plt object from image.")
+
+    except Exception as e:
+        msg = str(e) + "\n==========\n" + code + "\n===========" 
+        logging.error(msg)
+    
+    return res
+    
 
 def get_connection(project = 'phil') -> sqlite3.Connection:
     return sqlite3.connect(project + '.db')
@@ -288,8 +311,6 @@ def run_sql_query(connection: sqlite3.Connection, query: str) -> dict:
         logging.warning(f'Error: {e}')
     return result
 
-# messages = [{'role': 'system', 'content': 'What is three plus one?'}]
-
 def convert_python_if_necessary(connection: sqlite3.Connection, message: str):
     """
     Looks for strings that intend to produce charts and redirects
@@ -300,7 +321,7 @@ def convert_python_if_necessary(connection: sqlite3.Connection, message: str):
     Args:
         connection: The active database connection
         message: The message returned from the LLM
-    
+
     Returns:
         str: Either the message unchanged or the code run and
              converted into svg
@@ -312,7 +333,7 @@ def convert_python_if_necessary(connection: sqlite3.Connection, message: str):
     print("Imports", "import matplotlib.pyplot" in m)
     if not m.startswith('```python') or not m.endswith('```'):
         return message
-    
+
     #OK, it's at least python.
     if "import matplotlib.pyplot" not in m: return message
 
@@ -325,25 +346,15 @@ def get_answer(
     question:str, history: list[dict] = [], 
     model: str = DEFAULT_MODEL, final_model: str = None) -> tuple[str, list[dict], ChatResponse]:
 
-    if final_model is None: final_model = model
-
     def sql_query(query: str):
-        """
-        Runs an SQL query and returns the result as a dict
-
-        Args:
-            query: The query to be run
-
-        Returns:
-            dict: The results object
-        """
+        """Run a SQL SELECT query on a SQLite database and return the results."""
         return run_sql_query(connection, query)
    
     def generate_graph(code: str):
         """
         Executes a block of python code to generate charts and graphs.  The 
-        code is expected to use matplotlib and pandas, along with the sql_query
-        function.
+        code is expected to use matplotlib.pyplot to generate the graph and
+        use data already fetched or call the sql_query function
 
         Args:
             code: The python code to generate the graph or chart
@@ -353,42 +364,55 @@ def get_answer(
         """
         return run_generate_graph(connection, code)
    
-    history.append({'role': 'user', 'content': question})
     available_functions = {
-        'sql_query': sql_query,
-        'generate_graph': generate_graph,
+        'sql_query': {'func': sql_query, 'needs_followup': True },
+        'generate_graph': {'func': generate_graph, 'needs_followup': False}
     }
-    response = chat(
-        model=model,
-        messages=history,
-        tools=list(available_functions.values()),
-        format="json"
-    )
+    tools = [ f['func'] for f in available_functions.values() ]
 
+    history.append({'role': 'user', 'content': question})
+    
+    # TODO: The move here might be to first call a code
+    # generating bot.  Maybe I can tell the bot that
+    # if the request doesn't require code, it should
+    # respond with "Not for me" or something.  Speed
+    # is my biggest concern
+
+    response = chat(model=model, messages=history, tools=tools, options={'temperature': 0})
     if response.message.tool_calls:
         # There may be multiple tool calls in the response
+        history.append(response.message.model_dump())
         for tool in response.message.tool_calls:
             # Ensure the function is available, and then call it
-            if function_to_call := available_functions.get(tool.function.name):
+            if function_info := available_functions.get(tool.function.name):
                 logging.debug(f"Calling function: '{tool.function.name}'")
                 logging.debug(f"Arguments:{tool.function.arguments}'")
-                output = function_to_call(**tool.function.arguments)
+                print(f"Calling function: '{tool.function.name}'")
+                print(f"Arguments:{tool.function.arguments}'")
+                output = function_info['func'](**tool.function.arguments)
+                history.append({'role': 'tool', 'content': str(output), 'name': tool.function.name})
             else:
                 logging.warning(f"Function '{tool.function.name}' not found")
+        
+        # This code has a problem in that it will only give the user the very last response.
+        # Hopefully, that's OK? Should this code handle the possibility that a response
+        # to a tool calls chat ALSO needs calls?
+        last_name = (history[-1] or {}).get('name','')
+        last_info = available_functions.get(last_name,{'func': None, 'needs_followup': True})
+        followup = last_info['needs_followup']
+    
+        if followup:
+            if final_model is None: final_model = model
+            response = chat(final_model, messages=history, options={'temperature': 0})
+        else:
+            last_msg = history[-1]
+            last_msg['role'] = 'assistant'
+            response.message = Message(**last_msg)
 
-        history.append(response.message)
-        history.append({'role': 'tool', 'content': str(output), 'name': tool.function.name})
-        response = chat(final_model, messages=history)
-
-    converted = convert_python_if_necessary(history, response.message.content)
-    print(converted)
-    history.append({'role': 'assistant', 'content': response.message.content})
-
-    # Now that we've got our answer, we're going to pull the "Message" out of the 
-    # history because it's not serializable (and hopefully not necessary?)
-    history  = [ itm for itm in history if type(itm) == dict ]
-
-    return (response.message.content, history, response)
+    response.message.content = convert_python_if_necessary(connection, response.message.content)
+    history.append(response.message.model_dump())
+    
+    return (response.message.content, history)
 
 def create_model_with_system(model:str = DEFAULT_MODEL, from_model:str = DEFAULT_BASE):
     client = Client()
@@ -428,13 +452,10 @@ if __name__ == '__main__':
         quit()
         
     connection = initialize_database()
-    stock_qs = [
-        "How many rows are there?",
-    ]
     history=[]
-    for q in stock_qs:
+    for q in STOCK_QUESTIONS:
         print(f'{qf}Asked:{ef} {qtf}{q}{ef}')
-        response, history, _ = get_answer(connection, 'How many rows are there?', history=history)
+        response, history = get_answer(connection, 'How many rows are there?', history=history)
         print(f'{af}Answered:{ef} {atf}{response}{ef}')
         print('')
 
@@ -443,7 +464,7 @@ if __name__ == '__main__':
         text = input(f'{qf}Ask:{ef} {qtf}')
         print(f'{ef}', end='')
         if not text: continue
-        response, history, _ = get_answer(connection, text, history=history)
+        response, history = get_answer(connection, text, history=history)
         print(f'{af}Answer:{ef} {atf}{response}{ef}')
         print('')
 

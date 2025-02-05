@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
 
-from agent import get_connection, get_answer, initialize_database
+from agent import get_connection, get_answer, initialize_database, STOCK_HISTORY
 
 
 ######## Constants
@@ -46,6 +46,9 @@ app.add_middleware(
 )
 
 async def get_session(request: Request):
+    print("***")
+    print(request.cookies)
+    print("***")
     return request.session
 
 SessionDep = Annotated[dict, Depends(get_session)]
@@ -75,12 +78,12 @@ def save_history(history:list[dict], session:dict):
 
 def ask_question(question: str, session: dict) -> str:
     history = load_history(session)
-    result, history, _ = get_answer(connect_to_data(session), question, history)
+    print("History", len(history))
+    result, history = get_answer(connect_to_data(session), question, history)
     save_history(history, session)
     return result
 
 @app.get("/")
 async def read_root(q: str, session: SessionDep):
-    print(session)
     result = ask_question(q, session)
     return {"answer": result}
