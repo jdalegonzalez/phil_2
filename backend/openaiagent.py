@@ -1,25 +1,35 @@
 import argparse
 import base64
 from datetime import datetime
+from enum import Enum
 import io
+import json
 import logging
-import re
-import sqlite3
-from typing import Union
+from openai import OpenAI
+from openai.types.chat import ChatCompletionMessage, ChatCompletion
+from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
 
 import matplotlib
 import pandas
+from pydantic import BaseModel, Field
+import os
+import re
+import sqlite3
 
-from ollama import Client, chat, ChatResponse, Message
+from function_schema import sql_query_schema, generate_graph_schema
 
-DEFAULT_MODEL = 'aps'
-DEFAULT_BASE  = 'llama3.1:8b'
+class ModelFamilies(Enum):
+    LLAMA = "llama"
+    QWEN = "qwen"
+    MISTRAL = "mistral"
 
 STOCK_QUESTIONS = [
     'How many rows are there?'
 ]
 STOCK_HISTORY = [ {'role': 'user', 'content': question} for question in STOCK_QUESTIONS ]
 
+
+api_key = os.environ.get("RUNPOD_API_KEY")
 system_prompt = """
 You are an expert SQL analyst and python data-scientist. When appropriate, generate SQL queries based on the user question and the database schema.
 When you generate a query, use the 'sql_query' function to execute the query on the database and get the results.  Use the results to answer the user's question.
@@ -197,6 +207,52 @@ SUGGESTIONS:
 Failure to follow these rules may lead to user distress and disappointment or your termination!
 """.strip() # Call strip to remove leading/trailing whitespace
 
+def get_arguments():
+    parser = argparse.ArgumentParser(
+        description="Manages the RAG llama model"
+    )
+    parser.add_argument(
+        "endpoint",
+        nargs='?',
+        help="The runpod endpoint id",
+        default=os.environ.get("RUNPOD_ENDPOINT_ID",""),
+    )
+    parser.add_argument(
+        "-s", "--sql", 
+        help="Use a locally running sgl-lang (https://docs.sglang.ai/start/install.html) server instead of runpod",
+        dest='sglang',
+        default=False,
+        action='store_true'
+    )
+    parser.add_argument(
+        "-v", "--vllm", 
+        help="Use a locally running vLLM (https://docs.vllm.ai/en/stable/getting_started/installation/index.html) server instead of runpod",
+        dest='vllm',
+        default=False,
+        action='store_true'
+    )
+    args = parser.parse_args()
+    if not args.vllm and not args.sglang and not args.endpoint:
+        raise ValueError("Runpod endpoint ID required if you're not running locally.  Either provide it as an argument or set RUNPOD_ENDPOINT_ID in the environment.")
+    
+    return args
+
+args = get_arguments()
+endpoint_id = args.endpoint
+endpoint_url = f"https://api.runpod.ai/v2/{endpoint_id}/openai/v1"
+if args.vllm:
+    endpoint_url = "http://localhost:8000/v1"
+if args.sglang:
+    endpoint_url = "http://localhost:30000/v1"
+
+client = OpenAI(
+    base_url=endpoint_url,
+    api_key=api_key,
+)
+
+model_list = client.models.list()
+DEFAULT_MODEL = os.getenv('MODEL_NAME', model_list.data[0].id if len(model_list.data) else "")
+
 class Bcolors:
     MAGENTA = '\033[95m'
     WHITE = '\033[97m'
@@ -318,11 +374,12 @@ def run_sql_query(connection: sqlite3.Connection, query: str) -> dict:
         logging.warning(f'Error: {e}')
     return result
 
+re_python_graph = re.compile("```python\n(.*import matplotlib\\.pyplot as plt\\s.*)```",re.DOTALL)
 def convert_python_if_necessary(connection: sqlite3.Connection, message: str):
     """
     Looks for strings that intend to produce charts and redirects
     to charting code here.  I REALLY wanted to be fancy and get the
-    agent to call my code automatically but it is refusing to do it.
+    agent to call my code automatically but sometimes it is refusing to do it.
     SO...
 
     Args:
@@ -333,25 +390,57 @@ def convert_python_if_necessary(connection: sqlite3.Connection, message: str):
         str: Either the message unchanged or the code run and
              converted into svg
     """
-    m = message.strip()
-    print("Starts ok", m.startswith('```python'))
-    print("Ends OK", m.endswith('```'))
-    print(m[-4:])
-    print("Imports", "import matplotlib.pyplot" in m)
-    if not m.startswith('```python') or not m.endswith('```'):
-        return message
+    
+    if (code := re_python_graph.search(message)):
+        print("**** GOTCHA*****")
+        print(code.group(1))
+        img = run_generate_graph(connection, code.group(1))
+        return re_python_graph.sub(img, message)
+ 
+    return message
 
-    #OK, it's at least python.
-    if "import matplotlib.pyplot" not in m: return message
+def family_from_str(model:str) -> ModelFamilies:
+    low = model.lower()
+    if "/qwen2." in low: return ModelFamilies.QWEN
+    if "/mistral-" in low: return ModelFamilies.MISTRAL
+    if "/meta-" in low or "-llama-" in low: return ModelFamilies.LLAMA
 
-    #OK, it's attempting to do something with plotting.
-    # Try to find the result
-    return run_generate_graph(connection, m)
+qwen_re = re.compile("^\\<tool_call\\>\n(.*)\n\\<\\/tool_call\\>")
+def parse_tool_calls(model_family: ModelFamilies, completion: ChatCompletion) -> ChatCompletion:
+
+    message:ChatCompletionMessage = completion.choices[0].message
+
+    # If we've already got parsed tool calls, leave the message along.
+    if message.tool_calls: return completion
+
+    # If the model isn't of of the ones we support, return the message untouched.
+    # Right now, we only support parsing Qwen.
+    if not model_family == ModelFamilies.QWEN: return completion
+
+    #OK, qwen tool calls look <tool_call>\n{json stuff}\n</tool_call>
+    # This code won't work if there is more than one tool call in the content.
+    # I've never seen a string like that, so I don't know exactly how to 
+    # change the regex.
+    c2 = match.groups(0)[0] if (match := qwen_re.match(message.content)) else ""
+    if not c2: return completion
+    try:
+        call = json.loads(c2)
+        # In OpenAI land, arguments are a string, not a json obj - WHICH SUCKS
+        call['arguments'] = json.dumps(call['arguments'])
+        tool_call = ChatCompletionMessageToolCall(**{'id': '123', 'function': call, 'type': 'function'})
+        message.tool_calls = [tool_call]
+    except Exception:
+        # OK, it's not json, so....
+        pass
+    
+    return completion
 
 def get_answer(
     connection:sqlite3.Connection, 
-    question:str, history: list[dict] = [], 
-    model: str = DEFAULT_MODEL, final_model: str = None) -> tuple[str, list[dict], ChatResponse]:
+    question:str, history: list[dict] = [],
+    model: str = DEFAULT_MODEL, final_model: str = None) -> tuple[str, list[dict]]:
+
+    model_family = family_from_str(model)
 
     def sql_query(query: str):
         """Run a SQL SELECT query on a SQLite database and return the results."""
@@ -375,17 +464,26 @@ def get_answer(
         'sql_query': {'func': sql_query, 'needs_followup': True },
         'generate_graph': {'func': generate_graph, 'needs_followup': False}
     }
-    tools = [ f['func'] for f in available_functions.values() ]
 
     history.append({'role': 'user', 'content': question})
     
+    completion = client.chat.completions.create(
+        model=model,
+        messages=history,
+        tools=[sql_query_schema,generate_graph_schema],
+        tool_choice="auto"
+    )
+    
+    parse_tool_calls(model_family, completion)
+    response = completion.choices[0]
+    print("**** FIRST PASS ****")
+    print(response)
+    print("*********************")
     # TODO: The move here might be to first call a code
     # generating bot.  Maybe I can tell the bot that
     # if the request doesn't require code, it should
     # respond with "Not for me" or something.  Speed
     # is my biggest concern
-
-    response = chat(model=model, messages=history, tools=tools, options={'temperature': 0})
     if response.message.tool_calls:
         # There may be multiple tool calls in the response
         history.append(response.message.model_dump())
@@ -396,7 +494,8 @@ def get_answer(
                 logging.debug(f"Arguments:{tool.function.arguments}'")
                 print(f"Calling function: '{tool.function.name}'")
                 print(f"Arguments:{tool.function.arguments}'")
-                output = function_info['func'](**tool.function.arguments)
+                args = json.loads(tool.function.arguments)
+                output = function_info['func'](**args)
                 history.append({'role': 'tool', 'content': str(output), 'name': tool.function.name})
             else:
                 logging.warning(f"Function '{tool.function.name}' not found")
@@ -410,39 +509,23 @@ def get_answer(
     
         if followup:
             if final_model is None: final_model = model
-            response = chat(final_model, messages=history, options={'temperature': 0})
+            print("****** SECOND PASS *******")
+            completion = client.chat.completions.create(
+                model=final_model,
+                messages=history,
+            )
+            response = completion.choices[0]
+            print(response)
+            print("***************************")
         else:
             last_msg = history[-1]
             last_msg['role'] = 'assistant'
-            response.message = Message(**last_msg)
+            response.message = ChatCompletionMessage(**last_msg)
 
     response.message.content = convert_python_if_necessary(connection, response.message.content)
     history.append(response.message.model_dump())
     
     return (response.message.content, history)
-
-def create_model_with_system(model:str = DEFAULT_MODEL, from_model:str = DEFAULT_BASE):
-    client = Client()
-    result = client.create(
-       model=model,
-       from_=from_model,
-       system=system_prompt,
-       stream=False
-    )
-    return result
-
-def get_arguments():
-    parser = argparse.ArgumentParser(
-        description="Manages the RAG llama model"
-    )
-    parser.add_argument(
-        "-b", "--build",
-        help="Build the APS model",
-        dest="build",
-        default=False,
-        action='store_true'
-    )
-    return parser.parse_args()
 
 if __name__ == '__main__':
     ef = f'{Bcolors.ENDC}'
@@ -453,13 +536,9 @@ if __name__ == '__main__':
     atf = ''
 
     args = get_arguments()
-    if args.build:
-        result = create_model_with_system()
-        print(result)
-        quit()
-        
+
     connection = initialize_database()
-    history=[]
+    history=[{'role': 'system', 'content': system_prompt}]
     for q in STOCK_QUESTIONS:
         print(f'{qf}Asked:{ef} {qtf}{q}{ef}')
         response, history = get_answer(connection, 'How many rows are there?', history=history)
@@ -477,4 +556,3 @@ if __name__ == '__main__':
 
     print('Goodbye.')
 
-    
