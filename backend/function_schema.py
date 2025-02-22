@@ -1,24 +1,19 @@
-
 sql_query_schema = {
     "type": "function",
     "function": {
         "name": "sql_query",
-        "description": "Run a SQL SELECT query on a SQLite database and return the results.",
+        "description": "Execute a sqlite3 SQL query",
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "SQL compatible with SQLite as a string"
+                    "description": "The SQL string to execute"
                 }
             },
-            "required": [
-                "query"
-            ],
-            "additionalProperties": False
+            "required": ["query"]
         },
-        "strict": True
-    }
+    },
 }
 
 generate_graph_schema = {
@@ -34,11 +29,25 @@ generate_graph_schema = {
                     "description": "python code that uses matplotlib.pyplot to generate a graph"
                 }
             },
-            "required": [
-                "code"
-            ],
-            "additionalProperties": False
+            "required": [  "code"  ],
         },
-        "strict": True
-    }
+    },
+}
+
+calculate_schema = {
+    "type": "function",
+    "function": {
+        "name": "calculate",
+        "description": "Evaluate a mathematical expression",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "The mathematical expression to evaluate",
+                }
+            },
+            "required": ["expression"],
+        },
+    },
 }

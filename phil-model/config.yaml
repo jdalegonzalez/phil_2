@@ -1,0 +1,21 @@
+build_commands: []
+environment_variables: {}
+external_package_dirs: []
+model_metadata:
+  example_model_input: {"prompt": "What is the meaning of life?"}
+model_name: Mistral 7B
+python_version: py311
+requirements:
+- transformers==4.49.0
+- sentencepiece==0.2.0
+- accelerate==1.4.0
+- torch==2.6.0
+
+resources:
+  accelerator: A10G
+  use_gpu: true
+
+secrets:
+  hf_access_token: null
+
+system_packages: []

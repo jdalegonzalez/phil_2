@@ -5,18 +5,21 @@ from enum import Enum
 import io
 import json
 import logging
+
+from groq import Groq
+
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessage, ChatCompletion
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
 
 import matplotlib
 import pandas
-from pydantic import BaseModel, Field
 import os
 import re
 import sqlite3
 
-from function_schema import sql_query_schema, generate_graph_schema
+from prompts import short_system_prompt as system_prompt
+from function_schema import sql_query_schema, generate_graph_schema, calculate_schema
 
 class ModelFamilies(Enum):
     LLAMA = "llama"
@@ -28,184 +31,8 @@ STOCK_QUESTIONS = [
 ]
 STOCK_HISTORY = [ {'role': 'user', 'content': question} for question in STOCK_QUESTIONS ]
 
-
-api_key = os.environ.get("RUNPOD_API_KEY")
-system_prompt = """
-You are an expert SQL analyst and python data-scientist. When appropriate, generate SQL queries based on the user question and the database schema.
-When you generate a query, use the 'sql_query' function to execute the query on the database and get the results.  Use the results to answer the user's question.
-ALWAYS use the results from 'sql_query' if available.
-* Do NOT explain how you got those results unless you're asked to.
-* You should only use SQL supported by sqlite3.  DO NOT try to fetch graphs or tables from the internet.
-* There is only one table so don't bother mentioning its name. Instead of talking about a database, use the word "system".
-* In table headings underscores should be replaced with spaces. 
-
-* ALWAYS FORMAT YOUR RESPONSE IN MARKDOWN
-
-* To create a graph, chart or plot use ONLY python, pandas, and pyplot from matplotlib.
-* Use the sql_query function to get the data or include the data you already have.
-* Make sure to use matplotlib and pyplot to generate the graph.
-* NEVER call 'show()'
-
-database_schema: [
-    {
-        table: 'eval',
-        columns: [
-            {
-                name: 'Date_Observation',
-                type: 'datetime'
-            },
-            {
-                name: 'School_Name',
-                type: 'string',  
-            },
-            {
-                name: 'APS_Cluster',
-                type: 'string'
-            },
-            {
-                name: 'Grade_Level',
-                type: 'string'
-            },
-            {
-                name: 'Subject___Content',
-                type: 'string'
-            },
-            {
-                name: 'Observer_Name',
-                type: 'string'
-            },
-            {
-                name: 'Observer_Email',
-                type: 'string'
-            },
-            {
-                name: 'Teacher_Name',
-                type: 'string'
-            },
-            {
-                name: 'Vision_and_Leadership',
-                type: 'int'
-            },
-            {
-                name: 'Student_Academic_Ownership',
-                type: 'int'
-            },
-            {
-                name: 'Standards_Alignment',
-                type: 'int'
-            },
-            {
-                name: 'Interdisciplinary_Integration',
-                type: 'int'
-            },
-            {
-                name: 'Instructional_role_of_teacher',
-                type: 'int'
-            },
-            {
-                name:  'Literacy_integration',
-                type: 'int'
-            },
-            {
-                name: 'Technology_Integration',
-                type: 'int'
-            },
-            {
-                name: 'Collaborative_learning_and_teamwork',
-                type: 'int'
-            },
-            {
-                name: 'Student_reflection_and_self-assessment',
-                type: 'int'
-            },
-            {
-                name: 'Real-World_Connections_STEM_Careers',
-                type: 'int'
-            },
-            {
-                name: 'Environmental_and_Cultural_Relevance',
-                type: 'int'
-            },
-            {
-                name: 'Formative_Assessment_and_Feedback',
-                type: 'int'
-            },
-            {
-                name: 'Celebrations',
-                type: 'string'
-            },
-            {
-                name: 'Opportunities_for_Growth',
-                type: 'string'
-            },
-            {
-                name: 'Overall_Comments',
-                type: 'string'
-            },
-            {
-                name: 'Next_Action_Steps',
-                type: 'string'
-            },
-            {
-                name: 'District_Supports_Needed',
-                type: 'string'
-            },
-            {
-                name: 'Total_Score',
-                type: 'int'
-            },
-            {
-                name: 'cc_email',
-                type: 'string'
-            },
-            {
-                name: 'id',
-                type: 'string'
-            },
-            {
-                name: 'Customer',
-                type: 'string'
-            },
-            {
-                name: 'Submission_time',
-                type: 'datetime'
-            },
-            {
-                name: 'Observer_Last_Name',
-                type: 'string'
-            },
-            {
-                name: 'Teacher_Last_Name'
-                type: 'string'
-            }                    
-        ]
-    }
-]
-
-RULES:
-  * Answer truthfully using the provided context.
-  * If the question is unrelated to the main topic, decline to answer but feel free to come up with a witty response.
-  * Don't make up links and URLs that don't exist in the conversation already.
-  * Say that you do not know if no answer is available to you.
-  * Respond in the correct written language.
-  * Be brief and concise with your response (max 1-2 sentences).
-  * Respond naturally and verify your answers.
-  * You can be witty sometimes but not always.
-  * Don't sound like a robot.
-
-PRESENTING ANALYSIS:
-  * Ppresent the data in the form of a table unless asked otherwise.
-  * When asked for Total Score DO provide an average for the grouping of data
-  * Do provide the average score when asked for scores e.g. If asked to summarize the data by School Name and there are 5 entries for Wesley School then you would present the average of the five. 
-  * If you calculate an average score just provide the score, do not display the calculation behind the average unless you are asked
-
-SUGGESTIONS:
-  * Always try to answer the question.
-  * Present at least 2 helpful suggestions after every output for showing more analysis. 
-    Provide the suggests as hyperlinks in the format: [This is a suggestion.](#). Before the suggestions, include a new line and then text: '**Here are some suggestions:**'.  
-
-Failure to follow these rules may lead to user distress and disappointment or your termination!
-""".strip() # Call strip to remove leading/trailing whitespace
+MAX_HISTORY = 100
+MAX_COMPLETION_TOKENS = 4096
 
 def get_arguments():
     parser = argparse.ArgumentParser(
@@ -215,7 +42,27 @@ def get_arguments():
         "endpoint",
         nargs='?',
         help="The runpod endpoint id",
-        default=os.environ.get("RUNPOD_ENDPOINT_ID",""),
+        default=""
+    )
+    parser.add_argument(
+        "-g", "--groq",
+        help="Use the groq endpoint.",
+        dest="groq",
+        default=False,
+        action='store_true'
+    )
+    parser.add_argument(
+        "-l", "--list",
+        help="List the models supported by the endpoint",
+        dest="list",
+        default=False,
+        action="store_true"
+    )
+    parser.add_argument(
+        "-m", "--model",
+        help="The model you want to use.  Call me with --list to see a list.",
+        dest="model",
+        default=""
     )
     parser.add_argument(
         "-s", "--sql", 
@@ -231,27 +78,24 @@ def get_arguments():
         default=False,
         action='store_true'
     )
+    parser.add_argument(
+        "--verbose",
+        help="Print each message either received from or sent to the AI",
+        default=False,
+        dest="verbose",
+        action="store_true"
+    )
     args = parser.parse_args()
-    if not args.vllm and not args.sglang and not args.endpoint:
-        raise ValueError("Runpod endpoint ID required if you're not running locally.  Either provide it as an argument or set RUNPOD_ENDPOINT_ID in the environment.")
     
+    if not args.endpoint:
+        args.endpoint = os.environ.get("RUNPOD_ENDPOINT_ID")
+    
+    if not args.vllm and not args.sglang and not args.groq and not args.endpoint:
+        name="Runpod"
+        env_name="RUNPOD_ENDPOINT_ID"
+        raise ValueError(f"{name} endpoint ID required if you're not running locally.  Either provide it as an argument or set {env_name} in the environment.")
+
     return args
-
-args = get_arguments()
-endpoint_id = args.endpoint
-endpoint_url = f"https://api.runpod.ai/v2/{endpoint_id}/openai/v1"
-if args.vllm:
-    endpoint_url = "http://localhost:8000/v1"
-if args.sglang:
-    endpoint_url = "http://localhost:30000/v1"
-
-client = OpenAI(
-    base_url=endpoint_url,
-    api_key=api_key,
-)
-
-model_list = client.models.list()
-DEFAULT_MODEL = os.getenv('MODEL_NAME', model_list.data[0].id if len(model_list.data) else "")
 
 class Bcolors:
     MAGENTA = '\033[95m'
@@ -265,6 +109,147 @@ class Bcolors:
     BOLD = '\033[1m'
     ITALIC = '\033[3m'
     UNDERLINE = '\033[4m'
+
+def log_interaction(message):
+    
+    to_log = message.model_dump() if not type(message) is dict else message
+
+    ef = f'{Bcolors.ENDC}'
+    bf = Bcolors.BOLD
+    qf = f'{bf}{Bcolors.CYAN}'
+    af = f'{bf}{Bcolors.MAGENTA}'
+    atf = qf
+
+    print(f'{af}Role: {ef}{to_log['role']}')
+    print(f'{atf}Content:{ef}\n{to_log['content']}')    
+    print("".ljust(80, u'\u2550')) 
+
+class ClientWrapper:
+    def __init__(self, use_groq, api_key):        
+        self.client = (
+            Groq(api_key=api_key) 
+            if use_groq else 
+            OpenAI(base_url=endpoint_url, api_key=api_key)
+        )
+        self.model = os.getenv('MODEL_NAME')
+        self.history = []
+        self.max_history = MAX_HISTORY
+        self.tool_schema = []
+        self.tools = []
+        self.max_completion_tokens = MAX_COMPLETION_TOKENS
+        self.models = []
+        self.verbose = False
+        self.system_logged = False
+
+    def set_model(self, model:str):
+        if model:
+            self.model = model
+        elif (os_model := os.getenv('MODEL_NAME')):
+            self.model = os_model
+        else:
+            # We weren't given a model and we don't 
+            # have a default, so try seeing what the client
+            # supports and picking one.
+            self.model = self.default_model_from_list(
+                self.model_names()
+            )
+
+    def model_names(self):
+        if not self.models:
+            self.models = self.client.models.list().data or []
+        
+        names = [ m.id for m in self.models ]
+        names.sort()
+        return names
+
+    def default_model_from_list(self, names):
+        def_model = None
+        for model_name in names:
+            if def_model is None: def_model = model_name
+            if ("llama-3.3" in model_name or "llama-3.1" in model_name) and not "vision-" in model_name:
+                def_model = model_name
+                break
+        
+        return def_model
+    
+    def add_system(history):
+        messages = [{
+            "role": "system",
+            "content": system_prompt
+        }]
+
+        messages.extend(history)
+        return messages
+    
+    def compose_messages(self, new_message):
+        del self.history[:max(0, len(self.history) - (self.max_history - 1))]
+        self.history.append(new_message)
+        messages = ClientWrapper.add_system(self.history)
+
+        if self.verbose:
+            if not self.system_logged:
+                log_interaction(messages[0])
+                self.system_logged = True
+            log_interaction(messages[-1])
+
+        return messages
+
+    def handle_tools(self, tool_calls):
+
+        # Process each tool call
+        for tool_call in tool_calls:
+            
+            # TODO: Add error handling here
+            function_name = tool_call.function.name
+            f = self.tools[function_name]
+            args = json.loads(tool_call.function.arguments)
+            
+            # Call the tool and get the response
+            function_response = f(**args)
+            messages = self.compose_messages({
+                "tool_call_id": tool_call.id, 
+                "role": "tool", # Indicates this message is from tool use
+                "name": function_name,
+                "content": json.dumps(function_response),
+            })
+
+        # Make an API call with the results of the tool calls
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages
+        )
+
+        # Return the final response
+        return response.choices[0].message
+
+    def ask_question(self, question: str):
+        new_message = {
+            "role": "user",
+            "content": question,
+        }
+        
+        messages = self.compose_messages(new_message)
+
+        # Make the initial API call to the AI endpoint
+        response = self.client.chat.completions.create(
+            model=self.model,          # LLM to use
+            messages=messages,         # Conversation history
+            stream=False,
+            tools=self.tool_schema,    # Available tools (i.e. functions) for our LLM to use
+            tool_choice="auto",        # Let our LLM decide when to use tools
+            max_completion_tokens=self.max_completion_tokens # Maximum number of tokens to allow in our response
+        )
+
+        # Extract the response and any tool call responses
+        response_message = response.choices[0].message
+        messages = self.compose_messages(response_message)
+
+        if ( tools := response_message.tool_calls ):
+            response_message = self.handle_tools(tools)
+            messages = self.compose_messages(response_message)
+        
+        # Return the result to the user
+        return response_message.content
 
 date_fix = re.compile(" \\([A-Z][a-zA-Z ]+ Time\\)")
 def to_date(val):
@@ -401,27 +386,29 @@ def convert_python_if_necessary(connection: sqlite3.Connection, message: str):
 
 def family_from_str(model:str) -> ModelFamilies:
     low = model.lower()
-    if "/qwen2." in low: return ModelFamilies.QWEN
-    if "/mistral-" in low: return ModelFamilies.MISTRAL
-    if "/meta-" in low or "-llama-" in low: return ModelFamilies.LLAMA
+    if "/qwen2." in low or low.startswith("qwen2."): return ModelFamilies.QWEN
+    if "/mistral-" in low or low.startswith("mistral-"): return ModelFamilies.MISTRAL
+    if "/meta-" in low or "-llama-" or low.startswith("llama-"): return ModelFamilies.LLAMA
 
 qwen_re = re.compile("^\\<tool_call\\>\n(.*)\n\\<\\/tool_call\\>")
 def parse_tool_calls(model_family: ModelFamilies, completion: ChatCompletion) -> ChatCompletion:
 
     message:ChatCompletionMessage = completion.choices[0].message
-
     # If we've already got parsed tool calls, leave the message along.
     if message.tool_calls: return completion
 
     # If the model isn't of of the ones we support, return the message untouched.
     # Right now, we only support parsing Qwen.
-    if not model_family == ModelFamilies.QWEN: return completion
 
+    if not model_family == ModelFamilies.QWEN:
+        return completion
+
+    re = qwen_re
     #OK, qwen tool calls look <tool_call>\n{json stuff}\n</tool_call>
     # This code won't work if there is more than one tool call in the content.
     # I've never seen a string like that, so I don't know exactly how to 
     # change the regex.
-    c2 = match.groups(0)[0] if (match := qwen_re.match(message.content)) else ""
+    c2 = match.groups(0)[0] if (match := re.match(message.content)) else ""
     if not c2: return completion
     try:
         call = json.loads(c2)
@@ -435,10 +422,24 @@ def parse_tool_calls(model_family: ModelFamilies, completion: ChatCompletion) ->
     
     return completion
 
+def clean_message(response):
+    """ Apparently, sometimes we get back a response that isn't valid
+        as a part of the history.  SO... we need to clean it up.  There
+        might be a better way to do this.  I need to check the Groq doc
+    """
+    new_message = response.message.model_dump()
+    if new_message.get('function_call', None) is None:
+        new_message.pop('function_call',None)
+    
+    new_message.pop('reasoning', None)
+    
+    return new_message
+
+
 def get_answer(
     connection:sqlite3.Connection, 
     question:str, history: list[dict] = [],
-    model: str = DEFAULT_MODEL, final_model: str = None) -> tuple[str, list[dict]]:
+    model: str = 'llama', final_model: str = None) -> tuple[str, list[dict]]:
 
     model_family = family_from_str(model)
 
@@ -470,8 +471,11 @@ def get_answer(
     completion = client.chat.completions.create(
         model=model,
         messages=history,
+        stream=False,
         tools=[sql_query_schema,generate_graph_schema],
-        tool_choice="auto"
+        tool_choice="auto",
+        temperature=1,
+        max_completion_tokens=4096
     )
     
     parse_tool_calls(model_family, completion)
@@ -486,7 +490,11 @@ def get_answer(
     # is my biggest concern
     if response.message.tool_calls:
         # There may be multiple tool calls in the response
-        history.append(response.message.model_dump())
+        new_message = clean_message(response)
+        
+        print("==*+*++*=",new_message,"==*+*+*++==")
+
+        history.append(new_message)
         for tool in response.message.tool_calls:
             # Ensure the function is available, and then call it
             if function_info := available_functions.get(tool.function.name):
@@ -496,7 +504,7 @@ def get_answer(
                 print(f"Arguments:{tool.function.arguments}'")
                 args = json.loads(tool.function.arguments)
                 output = function_info['func'](**args)
-                history.append({'role': 'tool', 'content': str(output), 'name': tool.function.name})
+                history.append({'role': 'tool', 'tool_call_id': tool.id, 'content': str(output), 'name': tool.function.name})
             else:
                 logging.warning(f"Function '{tool.function.name}' not found")
         
@@ -510,6 +518,7 @@ def get_answer(
         if followup:
             if final_model is None: final_model = model
             print("****** SECOND PASS *******")
+            for h in history: print("---",h,"---")
             completion = client.chat.completions.create(
                 model=final_model,
                 messages=history,
@@ -527,7 +536,102 @@ def get_answer(
     
     return (response.message.content, history)
 
+def calculate(expression):
+    """Evaluate a mathematical expression"""
+    result = eval(expression)
+    return {"result": result}
+
+def groq_test(connection, user_prompt, model):
+
+    def sql_query(query): return run_sql_query(connection, query)
+    
+    # Initialize the conversation with system and user messages
+    messages=[
+        {
+            "role": "system",
+            "content": system_prompt
+        },
+        {
+            "role": "user",
+            "content": user_prompt,
+        }
+    ]
+
+    # Define the available tools (i.e. functions) for our model to use
+    tools = [ calculate_schema, sql_query_schema ]
+
+    # Make the initial API call to Groq
+    response = client.chat.completions.create(
+        model=model, # LLM to use
+        messages=messages, # Conversation history
+        stream=False,
+        tools=tools, # Available tools (i.e. functions) for our LLM to use
+        tool_choice="auto", # Let our LLM decide when to use tools
+        max_completion_tokens=4096 # Maximum number of tokens to allow in our response
+    )
+
+    # Extract the response and any tool call responses
+    response_message = response.choices[0].message
+    tool_calls = response_message.tool_calls
+    if tool_calls:
+        # Define the available tools that can be called by the LLM
+        available_functions = {
+            "calculate": calculate,
+            "sql_query": sql_query,
+        }
+        # Add the LLM's response to the conversation
+        messages.append(response_message)
+
+        # Process each tool call
+        for tool_call in tool_calls:
+            function_name = tool_call.function.name
+            f = available_functions[function_name]
+            args = json.loads(tool_call.function.arguments)
+            # Call the tool and get the response
+            function_response = f(**args)
+            # Add the tool response to the conversation
+            messages.append(
+                {
+                    "tool_call_id": tool_call.id, 
+                    "role": "tool", # Indicates this message is from tool use
+                    "name": function_name,
+                    "content": json.dumps(function_response),
+                }
+            )
+        
+        # Make a second API call with the updated conversation
+        second_response = client.chat.completions.create(
+            model=model,
+            messages=messages
+        )
+        # Return the final response
+        return second_response.choices[0].message.content
+
+args = get_arguments()
+endpoint_id = args.endpoint
+
+if args.vllm:     endpoint_url = "http://localhost:8000/v1"
+elif args.sglang: endpoint_url = "http://localhost:30000/v1"
+else:             endpoint_url = f"https://api.runpod.ai/v2/{endpoint_id}/openai/v1"
+
+api_key = (
+    os.environ.get("GROQ_API_KEY")
+    if args.groq else
+    os.environ.get("RUNPOD_API_KEY")
+)
+
+client = ClientWrapper(args.groq, api_key)
+client.tool_schema = [ calculate_schema, sql_query_schema ]
+
 if __name__ == '__main__':
+
+    if args.list:
+        for name in client.model_names():
+            print(name)
+        exit()
+    
+    client.set_model(args.model)
+
     ef = f'{Bcolors.ENDC}'
     bf = Bcolors.BOLD
     qf = f'{bf}{Bcolors.CYAN}'
@@ -535,13 +639,32 @@ if __name__ == '__main__':
     qtf = Bcolors.WHITE
     atf = ''
 
-    args = get_arguments()
+    print(f"Using model: '{client.model}'")
 
     connection = initialize_database()
-    history=[{'role': 'system', 'content': system_prompt}]
+
+    def sql_query(query:str) -> dict:
+        return run_sql_query(connection, query)
+
+    def generate_graph(code: str) -> str:
+        return run_generate_graph(connection, code)    
+    
+    client.tools = {
+        'sql_query': sql_query,
+        'generate_graph': generate_graph,
+        'calculate': calculate
+    }
+    
+    client.verbose = args.verbose
+    #print(client.ask_question("What is 24 * 10 + 15"))
+    #print(client.ask_question("How many rows are in the database"))
+    #print(client.ask_question("What are the names of the columns"))
+
+    #exit(1)
+
     for q in STOCK_QUESTIONS:
         print(f'{qf}Asked:{ef} {qtf}{q}{ef}')
-        response, history = get_answer(connection, 'How many rows are there?', history=history)
+        response, history = get_answer(connection, 'How many rows are there?', history=history, model=model)
         print(f'{af}Answered:{ef} {atf}{response}{ef}')
         print('')
 
