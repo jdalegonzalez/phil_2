@@ -20,7 +20,7 @@ generate_graph_schema = {
     "type": "function",
     "function": {
         "name": "generate_graph",
-        "description": "Takes python code that calls matplotlib.pyplot to generate a chart or graph, runs the python code in interpreter and returns an SVG version of the graph",
+        "description": "Runs the python code that uses matplotlib in interpreter and returns an SVG version of the graph",
         "parameters": {
             "type": "object",
             "properties": {

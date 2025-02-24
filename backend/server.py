@@ -11,8 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
 
-from agent import get_connection, get_answer, initialize_database, STOCK_HISTORY
-
+from openaiagent import get_connection, get_client, initialize_database
 
 ######## Constants
 SESSION_AGE = 60 * 60 # 60 seconds * 60 = 1 hour
@@ -29,12 +28,16 @@ app.add_middleware(SessionMiddleware, secret_key=key, max_age=SESSION_AGE)
 origins = [
     "http://localhost",
     "http://localhost:3000",
+    "http://localhost:3001",
     "https://localhost",
     "https://localhost:3000",
+    "https://localhost:3001",
     "http://127.0.0.1",
     "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
     "https://127.0.0.1",
     "https://127.0.0.1:3000",
+    "https://127.0.0.1:3001",
 ]
 
 app.add_middleware(
@@ -46,9 +49,7 @@ app.add_middleware(
 )
 
 async def get_session(request: Request):
-    print("***")
-    print(request.cookies)
-    print("***")
+
     return request.session
 
 SessionDep = Annotated[dict, Depends(get_session)]
@@ -78,8 +79,9 @@ def save_history(history:list[dict], session:dict):
 
 def ask_question(question: str, session: dict) -> str:
     history = load_history(session)
-    print("History", len(history))
-    result, history = get_answer(connect_to_data(session), question, history)
+    client = get_client(connect_to_data(session), history=history)
+    result = client.ask_question(question)
+    history = client.history
     save_history(history, session)
     return result
 

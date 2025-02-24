@@ -5,12 +5,15 @@ from enum import Enum
 import io
 import json
 import logging
+from typing import Union, Callable
 
 from groq import Groq
 
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessage, ChatCompletion
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
+
+from pydantic import BaseModel, Field
 
 import matplotlib
 import pandas
@@ -34,22 +37,19 @@ STOCK_HISTORY = [ {'role': 'user', 'content': question} for question in STOCK_QU
 MAX_HISTORY = 100
 MAX_COMPLETION_TOKENS = 4096
 
+env_endpoint_type = os.getenv("AI_ENDPOINT_TYPE","").strip().upper()
+env_endpoint_id = os.getenv("AI_ENDPOINT_ID","")
+env_model_name = os.getenv("MODEL_NAME","")
+
 def get_arguments():
     parser = argparse.ArgumentParser(
         description="Manages the RAG llama model"
     )
     parser.add_argument(
-        "endpoint",
+        "endpoint_id",
         nargs='?',
-        help="The runpod endpoint id",
-        default=""
-    )
-    parser.add_argument(
-        "-g", "--groq",
-        help="Use the groq endpoint.",
-        dest="groq",
-        default=False,
-        action='store_true'
+        help="The remote system endpoint id",
+        default=env_endpoint_id
     )
     parser.add_argument(
         "-l", "--list",
@@ -62,24 +62,17 @@ def get_arguments():
         "-m", "--model",
         help="The model you want to use.  Call me with --list to see a list.",
         dest="model",
-        default=""
+        default=env_model_name
     )
     parser.add_argument(
-        "-s", "--sql", 
-        help="Use a locally running sgl-lang (https://docs.sglang.ai/start/install.html) server instead of runpod",
-        dest='sglang',
-        default=False,
-        action='store_true'
+        "-t", "--type",
+        help="The type of system we're talking to.",
+        choices=["VLLM","GROQ","SGLANG","RUNPOD"],
+        default=env_endpoint_type,
+        dest="endpoint_type"
     )
     parser.add_argument(
-        "-v", "--vllm", 
-        help="Use a locally running vLLM (https://docs.vllm.ai/en/stable/getting_started/installation/index.html) server instead of runpod",
-        dest='vllm',
-        default=False,
-        action='store_true'
-    )
-    parser.add_argument(
-        "--verbose",
+        "-v", "--verbose",
         help="Print each message either received from or sent to the AI",
         default=False,
         dest="verbose",
@@ -87,13 +80,11 @@ def get_arguments():
     )
     args = parser.parse_args()
     
-    if not args.endpoint:
-        args.endpoint = os.environ.get("RUNPOD_ENDPOINT_ID")
-    
-    if not args.vllm and not args.sglang and not args.groq and not args.endpoint:
-        name="Runpod"
-        env_name="RUNPOD_ENDPOINT_ID"
-        raise ValueError(f"{name} endpoint ID required if you're not running locally.  Either provide it as an argument or set {env_name} in the environment.")
+    if args.endpoint_type == "RUNPOD" and not args.endpoint:
+        env_name="AI_ENDPOINT_ID"
+        raise ValueError(
+            f"Runpod endpoint ID required.  Provide it as an argument or set {env_name} in the environment."
+        )
 
     return args
 
@@ -110,32 +101,41 @@ class Bcolors:
     ITALIC = '\033[3m'
     UNDERLINE = '\033[4m'
 
-def log_interaction(message):
+def log_interaction(message:dict):
     
-    to_log = message.model_dump() if not type(message) is dict else message
-
     ef = f'{Bcolors.ENDC}'
     bf = Bcolors.BOLD
     qf = f'{bf}{Bcolors.CYAN}'
     af = f'{bf}{Bcolors.MAGENTA}'
     atf = qf
 
-    print(f'{af}Role: {ef}{to_log['role']}')
-    print(f'{atf}Content:{ef}\n{to_log['content']}')    
+    print(f'{af}Role: {ef}{message['role']}')
+    print(f'{atf}Content:{ef}\n{message['content']}')    
     print("".ljust(80, u'\u2550')) 
 
+def log_ai_message(msg:dict):
+    logging.info("".ljust(80, u'\u2550')) 
+    logging.info(json.dumps(msg, indent=4))
+    logging.info("".ljust(80, u'\u2550'))
+    
+
+class ToolDef(BaseModel):
+    requires_followup: bool = Field(description="Whether to call the chat model again after tool results")
+    requires_db_connection: bool = Field(description="Whether the function takes the db connection as the first argument.")
+    fn: Callable = Field(description="A pointer to the function to call when directed by the model")
+
 class ClientWrapper:
-    def __init__(self, use_groq, api_key):        
+    def __init__(self, endpoint_type, endpoint_url, api_key, model=env_model_name):        
         self.client = (
             Groq(api_key=api_key) 
-            if use_groq else 
+            if endpoint_type == "GROQ" else 
             OpenAI(base_url=endpoint_url, api_key=api_key)
         )
-        self.model = os.getenv('MODEL_NAME')
+        self.model = model
         self.history = []
         self.max_history = MAX_HISTORY
         self.tool_schema = []
-        self.tools = []
+        self.tools:dict[str, ToolDef] = {}
         self.max_completion_tokens = MAX_COMPLETION_TOKENS
         self.models = []
         self.verbose = False
@@ -144,8 +144,8 @@ class ClientWrapper:
     def set_model(self, model:str):
         if model:
             self.model = model
-        elif (os_model := os.getenv('MODEL_NAME')):
-            self.model = os_model
+        elif env_model_name:
+            self.model = env_model_name
         else:
             # We weren't given a model and we don't 
             # have a default, so try seeing what the client
@@ -181,9 +181,18 @@ class ClientWrapper:
         messages.extend(history)
         return messages
     
-    def compose_messages(self, new_message):
+    def compose_messages(self, new_message:Union[dict,ChatCompletionMessage]) -> list[dict]:
+        
         del self.history[:max(0, len(self.history) - (self.max_history - 1))]
-        self.history.append(new_message)
+        
+        ### model dump can stick keys with None values and this causes pydantic
+        ### to throw errors.  We're going to drill any keys pointing to None.
+        msg = new_message \
+            if type(new_message) is dict else \
+                new_message.model_dump(exclude_none=True)
+
+        self.history.append(msg)
+        log_ai_message(msg)
         messages = ClientWrapper.add_system(self.history)
 
         if self.verbose:
@@ -197,30 +206,57 @@ class ClientWrapper:
     def handle_tools(self, tool_calls):
 
         # Process each tool call
+        need_followup = False
         for tool_call in tool_calls:
             
-            # TODO: Add error handling here
             function_name = tool_call.function.name
-            f = self.tools[function_name]
-            args = json.loads(tool_call.function.arguments)
-            
-            # Call the tool and get the response
-            function_response = f(**args)
-            messages = self.compose_messages({
-                "tool_call_id": tool_call.id, 
-                "role": "tool", # Indicates this message is from tool use
-                "name": function_name,
-                "content": json.dumps(function_response),
-            })
+            fdef = self.tools.get(function_name, None)
+            if not fdef:
+                messages = self.compose_messages({
+                    'tool_call_id': tool_call.id,
+                    'role': 'tool',
+                    'name': function_name,
+                    'content': json.dumps({'error': f"No registered function: '{function_name}'"})
+                })
+            else:
+                need_followup = need_followup or fdef.requires_followup
+                try:
+                    args = json.loads(tool_call.function.arguments)
+                    # Call the tool and get the response
+                    function_response = fdef.fn(self.connection, **args) \
+                        if fdef.requires_db_connection else \
+                        fdef.fn(**args)
+                except Exception as e:
+                    need_followup = True
+                    logging.error(e)
+                    function_response = { "error": str(e) }
+
+                messages = self.compose_messages({
+                    "tool_call_id": tool_call.id, 
+                    "role": "tool", # Indicates this message is from tool use
+                    "name": function_name,
+                    "content": json.dumps(function_response),
+                })
 
         # Make an API call with the results of the tool calls
+        if not need_followup:
+            # This code will only return the results from the
+            # last tool to the user.  If multiple tool calls get
+            # made, none of which need followup, then the user only
+            # sees the final result.  Hopefully, that's OK because
+            # there really isn't a notion of sending multiple responses
+            # to the user for a single query.
+            last_msg = self.history[-1]
+            last_msg['role'] = 'assistant'
+            return ChatCompletionMessage(**last_msg)            
+
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages
         )
-
         # Return the final response
         return response.choices[0].message
+
 
     def ask_question(self, question: str):
         new_message = {
@@ -292,7 +328,9 @@ def run_generate_graph(connection: sqlite3.Connection, code: str) -> str:
         # and kill it if we see it.  Yes, a hack.  Maybe the smarter models won't do this and maybe
         # the code specific model can be convinced to do it.
         clean = re.sub("\\.show\\(\\)(\n?)$", "\\1", code.strip())
-        print("*****\n",clean)
+
+        ### This version of sql_query gets put in "locals" so that
+        ### if the generated code references a graph, we have it.
         def sql_query(*a, **kw) -> dict:
             args = a if a else list(kw.values())
             query = args[0] if args else ''
@@ -352,13 +390,25 @@ def run_sql_query(connection: sqlite3.Connection, query: str) -> dict:
         dict: The results object
     """
     result = None
-    try:
-        result = pandas.read_sql_query(query, connection).to_dict(orient='records')
-    except Exception as e:
-        logging.warning(f"Bad query: '{query}'")
-        logging.warning(f'Error: {e}')
-    return result
+    
+    def do_query(q):
+        try:
+            result = pandas.read_sql_query(q, connection).to_dict(orient='records')
+            return (result, False)
+        except Exception as e:
+            logging.warning(f"Bad query: '{query}'")
+            logging.warning(f'Error: {e}')
+            return ({"error": str(e)}, True)
 
+    result, errored = do_query(query)
+    if errored and query.endswith(")"):
+        ## I've seen cases where a trailing ")" gets added to the query
+        ## and there is no open "(".  If we fail and the query ends with a ")", I'm
+        ## going to remove it and try again.
+        result, errored = do_query(query[-1])
+
+    return result
+    
 re_python_graph = re.compile("```python\n(.*import matplotlib\\.pyplot as plt\\s.*)```",re.DOTALL)
 def convert_python_if_necessary(connection: sqlite3.Connection, message: str):
     """
@@ -377,7 +427,6 @@ def convert_python_if_necessary(connection: sqlite3.Connection, message: str):
     """
     
     if (code := re_python_graph.search(message)):
-        print("**** GOTCHA*****")
         print(code.group(1))
         img = run_generate_graph(connection, code.group(1))
         return re_python_graph.sub(img, message)
@@ -422,215 +471,84 @@ def parse_tool_calls(model_family: ModelFamilies, completion: ChatCompletion) ->
     
     return completion
 
-def clean_message(response):
-    """ Apparently, sometimes we get back a response that isn't valid
-        as a part of the history.  SO... we need to clean it up.  There
-        might be a better way to do this.  I need to check the Groq doc
-    """
-    new_message = response.message.model_dump()
-    if new_message.get('function_call', None) is None:
-        new_message.pop('function_call',None)
-    
-    new_message.pop('reasoning', None)
-    
-    return new_message
-
-
-def get_answer(
-    connection:sqlite3.Connection, 
-    question:str, history: list[dict] = [],
-    model: str = 'llama', final_model: str = None) -> tuple[str, list[dict]]:
-
-    model_family = family_from_str(model)
-
-    def sql_query(query: str):
-        """Run a SQL SELECT query on a SQLite database and return the results."""
-        return run_sql_query(connection, query)
-   
-    def generate_graph(code: str):
-        """
-        Executes a block of python code to generate charts and graphs.  The 
-        code is expected to use matplotlib.pyplot to generate the graph and
-        use data already fetched or call the sql_query function
-
-        Args:
-            code: The python code to generate the graph or chart
-
-        Returns:
-            str: an embeddale svg.
-        """
-        return run_generate_graph(connection, code)
-   
-    available_functions = {
-        'sql_query': {'func': sql_query, 'needs_followup': True },
-        'generate_graph': {'func': generate_graph, 'needs_followup': False}
-    }
-
-    history.append({'role': 'user', 'content': question})
-    
-    completion = client.chat.completions.create(
-        model=model,
-        messages=history,
-        stream=False,
-        tools=[sql_query_schema,generate_graph_schema],
-        tool_choice="auto",
-        temperature=1,
-        max_completion_tokens=4096
-    )
-    
-    parse_tool_calls(model_family, completion)
-    response = completion.choices[0]
-    print("**** FIRST PASS ****")
-    print(response)
-    print("*********************")
-    # TODO: The move here might be to first call a code
-    # generating bot.  Maybe I can tell the bot that
-    # if the request doesn't require code, it should
-    # respond with "Not for me" or something.  Speed
-    # is my biggest concern
-    if response.message.tool_calls:
-        # There may be multiple tool calls in the response
-        new_message = clean_message(response)
-        
-        print("==*+*++*=",new_message,"==*+*+*++==")
-
-        history.append(new_message)
-        for tool in response.message.tool_calls:
-            # Ensure the function is available, and then call it
-            if function_info := available_functions.get(tool.function.name):
-                logging.debug(f"Calling function: '{tool.function.name}'")
-                logging.debug(f"Arguments:{tool.function.arguments}'")
-                print(f"Calling function: '{tool.function.name}'")
-                print(f"Arguments:{tool.function.arguments}'")
-                args = json.loads(tool.function.arguments)
-                output = function_info['func'](**args)
-                history.append({'role': 'tool', 'tool_call_id': tool.id, 'content': str(output), 'name': tool.function.name})
-            else:
-                logging.warning(f"Function '{tool.function.name}' not found")
-        
-        # This code has a problem in that it will only give the user the very last response.
-        # Hopefully, that's OK? Should this code handle the possibility that a response
-        # to a tool calls chat ALSO needs calls?
-        last_name = (history[-1] or {}).get('name','')
-        last_info = available_functions.get(last_name,{'func': None, 'needs_followup': True})
-        followup = last_info['needs_followup']
-    
-        if followup:
-            if final_model is None: final_model = model
-            print("****** SECOND PASS *******")
-            for h in history: print("---",h,"---")
-            completion = client.chat.completions.create(
-                model=final_model,
-                messages=history,
-            )
-            response = completion.choices[0]
-            print(response)
-            print("***************************")
-        else:
-            last_msg = history[-1]
-            last_msg['role'] = 'assistant'
-            response.message = ChatCompletionMessage(**last_msg)
-
-    response.message.content = convert_python_if_necessary(connection, response.message.content)
-    history.append(response.message.model_dump())
-    
-    return (response.message.content, history)
-
 def calculate(expression):
     """Evaluate a mathematical expression"""
     result = eval(expression)
     return {"result": result}
 
-def groq_test(connection, user_prompt, model):
+def get_endpoint_url(endpoint_type, endpoint_id):
 
-    def sql_query(query): return run_sql_query(connection, query)
-    
-    # Initialize the conversation with system and user messages
-    messages=[
-        {
-            "role": "system",
-            "content": system_prompt
-        },
-        {
-            "role": "user",
-            "content": user_prompt,
-        }
-    ]
+    if endpoint_type == "VLLM": endpoint_url = "http://localhost:8000/v1"
+    elif endpoint_type == "SGLANG": endpoint_url = "http://localhost:30000/v1"
+    elif endpoint_type == "RUNPOD": endpoint_url = f"https://api.runpod.ai/v2/{endpoint_id}/openai/v1"
+    else: endpoint_url = endpoint_type             
 
-    # Define the available tools (i.e. functions) for our model to use
-    tools = [ calculate_schema, sql_query_schema ]
+    return endpoint_url
 
-    # Make the initial API call to Groq
-    response = client.chat.completions.create(
-        model=model, # LLM to use
-        messages=messages, # Conversation history
-        stream=False,
-        tools=tools, # Available tools (i.e. functions) for our LLM to use
-        tool_choice="auto", # Let our LLM decide when to use tools
-        max_completion_tokens=4096 # Maximum number of tokens to allow in our response
+def get_client(
+
+    db_connection:sqlite3.Connection, 
+    model:str = env_model_name, 
+    history:list[dict] = [],
+    endpoint_type = env_endpoint_type, endpoint_id = env_endpoint_id):
+    endpoint_url = get_endpoint_url(endpoint_type, endpoint_id)
+
+    api_key = (
+        os.getenv("GROQ_API_KEY")
+        if endpoint_type == "GROQ" else
+        os.getenv("RUNPOD_API_KEY")
     )
 
-    # Extract the response and any tool call responses
-    response_message = response.choices[0].message
-    tool_calls = response_message.tool_calls
-    if tool_calls:
-        # Define the available tools that can be called by the LLM
-        available_functions = {
-            "calculate": calculate,
-            "sql_query": sql_query,
-        }
-        # Add the LLM's response to the conversation
-        messages.append(response_message)
+    client = ClientWrapper(endpoint_type, endpoint_url, api_key)
 
-        # Process each tool call
-        for tool_call in tool_calls:
-            function_name = tool_call.function.name
-            f = available_functions[function_name]
-            args = json.loads(tool_call.function.arguments)
-            # Call the tool and get the response
-            function_response = f(**args)
-            # Add the tool response to the conversation
-            messages.append(
-                {
-                    "tool_call_id": tool_call.id, 
-                    "role": "tool", # Indicates this message is from tool use
-                    "name": function_name,
-                    "content": json.dumps(function_response),
-                }
-            )
-        
-        # Make a second API call with the updated conversation
-        second_response = client.chat.completions.create(
-            model=model,
-            messages=messages
+    client.tool_schema = [
+        calculate_schema,
+        sql_query_schema,
+        generate_graph_schema
+    ]
+
+    client.tools = {
+        'sql_query': ToolDef(
+            requires_followup=True,
+            requires_db_connection=True,
+            fn=run_sql_query 
+        ),
+        'generate_graph': ToolDef(
+            requires_followup=False,
+            requires_db_connection=True,
+            fn=run_generate_graph
+        ),
+        'calculate': ToolDef(
+            requires_db_connection=False,
+            requires_followup=True,
+            fn=calculate
         )
-        # Return the final response
-        return second_response.choices[0].message.content
+    }
 
-args = get_arguments()
-endpoint_id = args.endpoint
+    client.set_model(model)
+    client.history = history
 
-if args.vllm:     endpoint_url = "http://localhost:8000/v1"
-elif args.sglang: endpoint_url = "http://localhost:30000/v1"
-else:             endpoint_url = f"https://api.runpod.ai/v2/{endpoint_id}/openai/v1"
+    client.connection = db_connection
 
-api_key = (
-    os.environ.get("GROQ_API_KEY")
-    if args.groq else
-    os.environ.get("RUNPOD_API_KEY")
-)
+    return client
 
-client = ClientWrapper(args.groq, api_key)
-client.tool_schema = [ calculate_schema, sql_query_schema ]
 
 if __name__ == '__main__':
+
+    args = get_arguments()
+    client = get_client(
+        initialize_database(), 
+        args.model, 
+        [], 
+        args.endpoint_type, 
+        args.endpoint_id
+    )
 
     if args.list:
         for name in client.model_names():
             print(name)
         exit()
     
-    client.set_model(args.model)
 
     ef = f'{Bcolors.ENDC}'
     bf = Bcolors.BOLD
@@ -641,31 +559,12 @@ if __name__ == '__main__':
 
     print(f"Using model: '{client.model}'")
 
-    connection = initialize_database()
-
-    def sql_query(query:str) -> dict:
-        return run_sql_query(connection, query)
-
-    def generate_graph(code: str) -> str:
-        return run_generate_graph(connection, code)    
-    
-    client.tools = {
-        'sql_query': sql_query,
-        'generate_graph': generate_graph,
-        'calculate': calculate
-    }
-    
     client.verbose = args.verbose
-    #print(client.ask_question("What is 24 * 10 + 15"))
-    #print(client.ask_question("How many rows are in the database"))
-    #print(client.ask_question("What are the names of the columns"))
-
-    #exit(1)
 
     for q in STOCK_QUESTIONS:
         print(f'{qf}Asked:{ef} {qtf}{q}{ef}')
-        response, history = get_answer(connection, 'How many rows are there?', history=history, model=model)
-        print(f'{af}Answered:{ef} {atf}{response}{ef}')
+        answer = client.ask_question('How many rows are there?')
+        print(f'{af}Answered:{ef} {atf}{answer}{ef}')
         print('')
 
     text ="x"
@@ -673,7 +572,7 @@ if __name__ == '__main__':
         text = input(f'{qf}Ask:{ef} {qtf}')
         print(f'{ef}', end='')
         if not text: continue
-        response, history = get_answer(connection, text, history=history)
+        response = client.ask_question(text)
         print(f'{af}Answer:{ef} {atf}{response}{ef}')
         print('')
 
