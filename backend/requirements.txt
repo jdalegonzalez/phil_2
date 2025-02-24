@@ -1,6 +1,8 @@
-ollama
-pandas
+dotenv
 fastapi[standard]
+groq
 itsdangerous
 matplotlib
 openai
+pandas
+pydantic

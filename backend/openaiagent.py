@@ -1,28 +1,27 @@
 import argparse
 import base64
 from datetime import datetime
+from dotenv import load_dotenv
 from enum import Enum
+from groq import Groq
 import io
 import json
 import logging
-from typing import Union, Callable
-
-from groq import Groq
-
+import matplotlib
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessage, ChatCompletion
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
-
-from pydantic import BaseModel, Field
-
-import matplotlib
 import pandas
+from pydantic import BaseModel, Field
 import os
 import re
 import sqlite3
+from typing import Union, Callable
 
-from prompts import short_system_prompt as system_prompt
 from function_schema import sql_query_schema, generate_graph_schema, calculate_schema
+from prompts import short_system_prompt as system_prompt
+
+load_dotenv()
 
 class ModelFamilies(Enum):
     LLAMA = "llama"

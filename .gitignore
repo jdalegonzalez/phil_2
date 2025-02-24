@@ -12,3 +12,5 @@ __pycache__
 # app
 *.db
 cookies.txt
+
+.env
